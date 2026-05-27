@@ -28,6 +28,7 @@ export interface CompleteInput {
     networkErrors: string[];
     suggestedFix?: string;
     videoUrl?: string;
+    previewUrl?: string;
 }
 export declare class MintApi {
     private base;

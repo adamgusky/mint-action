@@ -36640,6 +36640,8 @@ var __webpack_exports__ = {};
 
 // EXTERNAL MODULE: ../../node_modules/.pnpm/@actions+core@1.11.1/node_modules/@actions/core/lib/core.js
 var core = __nccwpck_require__(4442);
+;// CONCATENATED MODULE: external "node:child_process"
+const external_node_child_process_namespaceObject = require("node:child_process");
 ;// CONCATENATED MODULE: external "node:fs"
 const external_node_fs_namespaceObject = require("node:fs");
 var external_node_fs_default = /*#__PURE__*/__nccwpck_require__.n(external_node_fs_namespaceObject);
@@ -41381,7 +41383,7 @@ function buildParsePrompt(input) {
 ${steps || "      (no steps recorded)"}`;
     })
         .join("\n\n");
-    const featureSummary = input.productMap.features
+    const featureSummary = (input.productMap?.features ?? [])
         .slice(0, 20)
         .map((feature) => `  - ${feature.id}: ${feature.name} (routes: ${feature.routes.join(", ")})`)
         .join("\n") || "  (no features in product map)";
@@ -44819,6 +44821,7 @@ async function uploadMedia(opts) {
 
 
 
+
 async function run() {
     // Composite wrapper sets these env vars; fall back to core.getInput for local tests.
     const apiKey = process.env.MINT_API_KEY || core.getInput("api-key", { required: true });
@@ -44905,6 +44908,7 @@ async function run() {
     // Upload video. Browser runner returns its path via result.artifacts.video
     // OR a .webm in the reportDir.
     let videoUrl;
+    let previewUrl;
     try {
         let videoPath = result.artifacts?.video ?? "";
         if (!videoPath && reportDir && external_node_fs_default().existsSync(reportDir)) {
@@ -44923,6 +44927,27 @@ async function run() {
                 apiKey
             });
             core.info(`Video uploaded: ${videoUrl}`);
+            // Generate and upload animated GIF preview
+            try {
+                const gifPath = "/tmp/mint-preview.gif";
+                core.info("Generating animated GIF preview…");
+                (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -ss 4 -i "${videoPath}" -vf "fps=4,scale=720:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=sierra2_4a" -loop 0 "${gifPath}"`, { stdio: "pipe" });
+                if (external_node_fs_default().existsSync(gifPath)) {
+                    core.info("Uploading GIF preview…");
+                    previewUrl = await uploadMedia({
+                        runId: missionId,
+                        filename: "preview.gif",
+                        data: external_node_fs_default().readFileSync(gifPath),
+                        contentType: "image/gif",
+                        apiBase,
+                        apiKey
+                    });
+                    core.info(`GIF preview uploaded: ${previewUrl}`);
+                }
+            }
+            catch (err) {
+                core.warning(`GIF preview generation failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
         }
         else {
             core.info("No .webm in reportDir; skipping video upload.");
@@ -44939,7 +44964,8 @@ async function run() {
         consoleErrors: result.consoleErrors ?? [],
         networkErrors: result.networkErrors ?? [],
         suggestedFix: result.suggestedFix,
-        videoUrl
+        videoUrl,
+        previewUrl
     });
     core.info(`Result: ${result.status}`);
     if (result.status !== "passed" && result.status !== "skipped" && result.status !== "not_browser_testable") {
