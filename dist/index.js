@@ -44846,57 +44846,13 @@ async function run() {
     // Playwright + browser binaries are installed by the composite wrapper.
     const runDir = external_node_path_default().join(process.cwd(), ".mint-run");
     external_node_fs_default().mkdirSync(runDir, { recursive: true });
-    // Construct minimal MintConfig and MintPaths for the browser runner
-    const config = {
-        version: 2,
-        app: {
-            name: mission.flowName,
-            base_url: "https://app.example.com", // Will be overridden by flow, but required
-            mode: "production"
-        },
-        services: {},
-        auth: {
-            method: "none",
-            personas: {
-                [mission.persona]: {
-                    email: "test@example.com",
-                    password: "test"
-                }
-            }
-        },
-        setup: {
-            reset_command: "",
-            create_user_command: "",
-            seed_data_command: "",
-            set_plan_command: "",
-            set_role_command: "",
-            login_check_url: ""
-        },
-        bypass: {},
-        limits: {
-            max_steps: 100,
-            max_same_action_repeats: 5,
-            max_observe_steps_in_row: 3,
-            max_vision_calls: 10,
-            max_recovery_attempts: 2
-        },
-        budget: {
-            mode: "balanced"
-        },
-        artifacts: {
-            report: {
-                template: "steps"
-            },
-            video: {
-                mode: "ci",
-                width: 1440,
-                height: 1000,
-                step_pause_ms: 0,
-                final_pause_ms: 0,
-                annotations: false
-            }
-        }
-    };
+    // Server bundles the customer's mint.yml config into the mission so we don't
+    // have to fetch anything. Refuse to run without it — the placeholder would
+    // try to load https://app.example.com and immediately fail.
+    const config = mission.config;
+    if (!config) {
+        throw new Error("Mission did not include a config block. Server is out of date.");
+    }
     const paths = {
         cwd: process.cwd(),
         configPath: external_node_path_default().join(process.cwd(), "mint.yml"),
