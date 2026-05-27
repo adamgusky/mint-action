@@ -28,6 +28,10 @@ runs:
         fi
         npm install playwright@1.50.0 --no-save --silent
         npx --yes playwright install chromium --with-deps
+        # ffmpeg for the GIF preview Mint embeds in the PR comment.
+        if ! command -v ffmpeg >/dev/null 2>&1; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+        fi
 
     - name: Run Mint
       shell: bash

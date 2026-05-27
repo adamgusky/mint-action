@@ -44804,7 +44804,7 @@ async function generateClientTokenFromReadWriteToken({
 /** Client-side upload: streams directly to Vercel Blob via presign endpoint. */
 async function uploadMedia(opts) {
     const pathname = `runs/${opts.runId}/${opts.filename}`;
-    const blob = new Blob([opts.data], { type: opts.contentType });
+    const blob = new Blob([new Uint8Array(opts.data)], { type: opts.contentType });
     const result = await upload(pathname, blob, {
         access: "public",
         handleUploadUrl: `${opts.apiBase}/api/v1/media/presign`,
@@ -44927,7 +44927,8 @@ async function run() {
                 apiKey
             });
             core.info(`Video uploaded: ${videoUrl}`);
-            // Generate and upload animated GIF preview
+            // Generate and upload animated GIF preview using system ffmpeg
+            // (installed by the composite wrapper via apt-get).
             try {
                 const gifPath = "/tmp/mint-preview.gif";
                 core.info("Generating animated GIF preview…");
