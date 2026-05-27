@@ -42817,10 +42817,9 @@ async function run() {
     const api = new MintApi(apiBase, apiKey);
     core.info("Fetching mission…");
     const mission = await api.getMission(missionId);
-    core.info(`Mission: ${mission.flowName} (persona=${mission.persona})`);
+    const flowName = mission.flow?.name ?? mission.flowName ?? "(unnamed)";
+    core.info(`Mission: ${flowName} (persona=${mission.persona})`);
     // Playwright + browser binaries are installed by the composite wrapper.
-    const runDir = external_node_path_default().join(process.cwd(), ".mint-run");
-    external_node_fs_default().mkdirSync(runDir, { recursive: true });
     // Server bundles the customer's mint.yml config into the mission so we don't
     // have to fetch anything. Refuse to run without it — the placeholder would
     // try to load https://app.example.com and immediately fail.
@@ -42846,12 +42845,13 @@ async function run() {
         llm: judge,
         headed: false
     });
-    // Upload per-step screenshots first so we can attach URLs to step events.
-    // Browser runner writes them to <runDir>/step-screenshots/step-NN.png when
-    // artifacts.video.mode === "demo" && annotations === true (blawg's default).
-    const screenshotDir = external_node_path_default().join(runDir, "step-screenshots");
+    // Browser runner creates its own runDir under <cwd>/.mint/runs/<uuid> and
+    // returns its path via result.artifacts.reportDir. Use that for media.
+    const reportDir = result.artifacts?.reportDir ?? "";
+    core.info(`Report dir: ${reportDir || "(none reported)"}`);
+    const screenshotDir = reportDir ? external_node_path_default().join(reportDir, "step-screenshots") : "";
     const stepUrls = new Map();
-    if (external_node_fs_default().existsSync(screenshotDir)) {
+    if (screenshotDir && external_node_fs_default().existsSync(screenshotDir)) {
         const files = external_node_fs_default().readdirSync(screenshotDir).filter((f) => /^step-\d+\.png$/.test(f)).sort();
         core.info(`Uploading ${files.length} step screenshot(s)…`);
         for (const file of files) {
@@ -42888,16 +42888,22 @@ async function run() {
             core.warning(`Failed to post step ${stepIndex}: ${err.message}`);
         });
     }
-    // Upload video. Playwright writes a .webm with a hash name; pick the first one we find.
+    // Upload video. Browser runner returns its path via result.artifacts.video
+    // OR a .webm in the reportDir.
     let videoUrl;
     try {
-        const webms = external_node_fs_default().existsSync(runDir) ? external_node_fs_default().readdirSync(runDir).filter((f) => f.endsWith(".webm")) : [];
-        if (webms.length > 0) {
-            core.info(`Uploading video ${webms[0]}…`);
+        let videoPath = result.artifacts?.video ?? "";
+        if (!videoPath && reportDir && external_node_fs_default().existsSync(reportDir)) {
+            const webms = external_node_fs_default().readdirSync(reportDir).filter((f) => f.endsWith(".webm"));
+            if (webms.length > 0)
+                videoPath = external_node_path_default().join(reportDir, webms[0]);
+        }
+        if (videoPath && external_node_fs_default().existsSync(videoPath)) {
+            core.info(`Uploading video ${external_node_path_default().basename(videoPath)}…`);
             videoUrl = await uploadMedia({
                 runId: missionId,
                 filename: "video.webm",
-                data: external_node_fs_default().readFileSync(external_node_path_default().join(runDir, webms[0])),
+                data: external_node_fs_default().readFileSync(videoPath),
                 contentType: "video/webm",
                 apiBase,
                 apiKey
@@ -42905,7 +42911,7 @@ async function run() {
             core.info(`Video uploaded: ${videoUrl}`);
         }
         else {
-            core.info("No .webm in runDir; skipping video upload.");
+            core.info("No .webm in reportDir; skipping video upload.");
         }
     }
     catch (err) {
