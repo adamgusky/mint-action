@@ -1,0 +1,19 @@
+name: "Mint QA"
+description: "Run Mint QA against the current PR using a server-issued mission."
+branding:
+  icon: "check-circle"
+  color: "green"
+inputs:
+  api-key:
+    description: "MINT_API_KEY from your getmint.com dashboard."
+    required: true
+  mission-id:
+    description: "Mission UUID dispatched by the Mint GitHub App."
+    required: true
+  api-base:
+    description: "Override the Mint API base URL (defaults to https://app.getmint.com)."
+    required: false
+    default: "https://app.getmint.com"
+runs:
+  using: "node20"
+  main: "dist/index.js"
