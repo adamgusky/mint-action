@@ -42875,17 +42875,21 @@ async function run() {
             }
         }
     }
-    // Stream step events with screenshot URLs attached.
-    for (const stepStr of result.steps) {
-        stepIndex += 1;
+    // Source step intents from the flow definition (always present) and pair
+    // with screenshot URLs we just uploaded. result.steps is sometimes empty
+    // even on success so this is more reliable.
+    const flowSteps = (mission.flow?.steps ?? []);
+    const stepsToPost = flowSteps.length > 0 ? flowSteps.map((s, i) => ({ index: i + 1, intent: s.intent ?? `Step ${i + 1}`, type: s.type ?? "action" })) : result.steps.map((s, i) => ({ index: i + 1, intent: s, type: "action" }));
+    const stepStatus = result.status === "passed" ? "ok" : "executed";
+    for (const s of stepsToPost) {
         await api.postStep(missionId, {
-            index: stepIndex,
-            type: "action",
-            intent: stepStr,
-            status: "executed",
-            screenshotUrl: stepUrls.get(stepIndex)
+            index: s.index,
+            type: s.type,
+            intent: s.intent,
+            status: stepStatus,
+            screenshotUrl: stepUrls.get(s.index)
         }).catch((err) => {
-            core.warning(`Failed to post step ${stepIndex}: ${err.message}`);
+            core.warning(`Failed to post step ${s.index}: ${err.message}`);
         });
     }
     // Upload video. Browser runner returns its path via result.artifacts.video
