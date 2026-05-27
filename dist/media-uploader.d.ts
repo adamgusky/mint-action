@@ -6,5 +6,5 @@ export interface UploadMediaOptions {
     apiBase: string;
     apiKey: string;
 }
-/** Server-side upload: POSTs raw bytes to /api/v1/media/upload with Bearer auth. */
+/** Client-side upload: streams directly to Vercel Blob via presign endpoint. */
 export declare function uploadMedia(opts: UploadMediaOptions): Promise<string>;
