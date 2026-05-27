@@ -43147,19 +43147,19 @@ class MintApi {
         return res.json();
     }
     getMission(id) {
-        return this.request("GET", `/v1/runs/${id}/mission`);
+        return this.request("GET", `/api/v1/runs/${id}/mission`);
     }
     postStep(id, body) {
-        return this.request("POST", `/v1/runs/${id}/step`, body);
+        return this.request("POST", `/api/v1/runs/${id}/step`, body);
     }
     postComplete(id, body) {
-        return this.request("POST", `/v1/runs/${id}/complete`, body);
+        return this.request("POST", `/api/v1/runs/${id}/complete`, body);
     }
     postJudge(id, ask) {
-        return this.request("POST", `/v1/runs/${id}/judge`, ask);
+        return this.request("POST", `/api/v1/runs/${id}/judge`, ask);
     }
     syncFlows(repoId, flows) {
-        return this.request("POST", `/v1/flows/sync`, {
+        return this.request("POST", `/api/v1/flows/sync`, {
             repoId,
             flows
         });
