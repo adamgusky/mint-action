@@ -3,17 +3,38 @@ description: "Run Mint QA against the current PR using a server-issued mission."
 branding:
   icon: "check-circle"
   color: "green"
+
 inputs:
   api-key:
-    description: "MINT_API_KEY from your getmint.com dashboard."
+    description: "MINT_API_KEY from your Mint dashboard."
     required: true
   mission-id:
     description: "Mission UUID dispatched by the Mint GitHub App."
     required: true
   api-base:
-    description: "Override the Mint API base URL (defaults to https://app.getmint.com)."
+    description: "Override the Mint API base URL."
     required: false
-    default: "https://app.getmint.com"
+    default: "https://mint-blond-six.vercel.app"
+
 runs:
-  using: "node20"
-  main: "dist/index.js"
+  using: "composite"
+  steps:
+    - name: Install Playwright in action dir
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        if [ ! -f package.json ]; then
+          echo '{"name":"mint-action-runtime","version":"0.0.0","private":true}' > package.json
+        fi
+        npm install playwright@1.50.0 --no-save --silent
+        npx --yes playwright install chromium --with-deps
+
+    - name: Run Mint
+      shell: bash
+      env:
+        MINT_API_KEY: ${{ inputs.api-key }}
+        MINT_MISSION_ID: ${{ inputs.mission-id }}
+        MINT_API_BASE: ${{ inputs.api-base }}
+      run: |
+        export NODE_PATH="${{ github.action_path }}/node_modules"
+        node "${{ github.action_path }}/dist/index.js"
