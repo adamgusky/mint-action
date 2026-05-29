@@ -41250,46 +41250,60 @@ function generation_truncate(value, max) {
 
 
 
-const PARSE_COMMENT_SYSTEM = (/* unused pure expression or super */ null && (`You translate a PR comment from a developer into a set of recorded Mint flows to run.
+const PARSE_COMMENT_SYSTEM = (/* unused pure expression or super */ null && (`You translate a PR comment from a developer into a Mint QA action.
 
-You are given:
-- The comment body (the developer's request).
-- A catalog of recorded flows that already exist for this app. Each has an id, a name, preconditions, related routes, and related source files.
+You receive:
+- The comment body (the developer's request, written in plain English).
+- A list of recorded flows that already exist for this app.
+- The app's product map (features, routes).
 - The list of personas defined in mint.yml.
-- A summary of the PR's diff (changed files) for context, so vague requests like "test the thing I just changed" can be grounded.
-- A summary of the app's features.
+- The PR's changed files for context.
 
-You return ONLY flow ids that appear verbatim in the catalog. You never invent flow ids. If the developer asks for a flow that does not exist, list it in "rejected" with a short reason — do NOT guess a similar id.
+Your job is to decide ONE of:
 
-When the developer writes only "@mint" (no instructions beyond that), return an empty flows array and set fallbackToPrDiff to true; the caller will fall back to PR-diff QA.
+1) "match" — at least one recorded flow already covers exactly what the developer asked for. Return those flow ids.
 
-When the developer writes "@mint test all", return every flow in the catalog (up to the maxFlows cap).
+2) "generate" — the developer described something that does NOT already have a recorded flow (or matches loosely). Return a short, specific testIntent in plain English so a downstream LLM can synthesize a new ephemeral flow from the source code. The intent should be ACTIONABLE — describe what to click, fill, and verify, not abstract goals.
 
-Persona override: only set persona on a flow when the developer explicitly names a persona that exists in mint.yml ("as fresh_user", "with admin"). Otherwise omit it and the runner uses the flow's recorded persona.
+3) "fallback" — the comment is bare "@mint" with no instruction. The caller will run PR-diff auto-QA.
 
-Be conservative with confidence: 0.95+ for exact id matches, 0.8+ for clear fuzzy name matches, 0.6+ for inferred-from-diff selections, lower if you're guessing.`));
+4) "clarify" — the comment is too vague even to generate from (e.g. "@mint test things"). Return a short clarifyMessage explaining what you need.
+
+Persona overrides are ONLY allowed when the developer named a persona that exists in mint.yml. Otherwise omit.
+
+You never invent flow ids. If you're not sure whether a recording matches, prefer "generate" — it's better to synthesize a fresh flow than to mis-route to the wrong recording.`));
 const RESPONSE_JSON_SHAPE = (/* unused pure expression or super */ null && (`{
-  "flows": [
-    { "id": "<flow id from catalog>", "persona": "<optional persona id>", "preconditions": ["optional", "overrides"], "reason": "why this flow matches the comment", "confidence": 0.0 }
+  "mode": "match" | "generate" | "fallback" | "clarify",
+  "flows": [                                  // only when mode == "match"
+    { "id": "<flow id>", "persona": "<optional>", "reason": "...", "confidence": 0.0 }
   ],
-  "notes": "optional short note — e.g. 'capped at 5; user asked for 7' or 'used diff context to pick flows'",
-  "rejected": ["optional list of phrases or ids you could not resolve to a real flow"],
-  "fallbackToPrDiff": false
+  "generate": {                                // only when mode == "generate"
+    "testIntent": "Click the X button, fill Y, verify Z appears.",
+    "persona": "<optional persona id from mint.yml>",
+    "relatedRoutes": ["/optional/route/hint"]
+  },
+  "clarifyMessage": "...",                     // only when mode == "clarify"
+  "notes": "optional short note"
 }`));
-const parsedFlowSchema = objectType({
+const matchedFlowSchema = objectType({
     id: stringType().min(1),
     persona: stringType().optional(),
-    preconditions: arrayType(stringType()).optional(),
     reason: stringType().default(""),
     confidence: numberType().min(0).max(1).default(0.5)
 });
-const parseResponseSchema = objectType({
-    flows: arrayType(parsedFlowSchema).default([]),
-    notes: stringType().optional(),
-    rejected: arrayType(stringType()).optional(),
-    fallbackToPrDiff: booleanType().default(false)
+const generateBriefSchema = objectType({
+    testIntent: stringType().min(1),
+    persona: stringType().optional(),
+    relatedRoutes: arrayType(stringType()).optional()
 });
-/** Strip the "@mint" mention (and any leading verbs) to see if the comment carried real instructions. */
+const parseResponseSchema = objectType({
+    mode: enumType(["match", "generate", "fallback", "clarify"]),
+    flows: arrayType(matchedFlowSchema).default([]),
+    generate: generateBriefSchema.optional(),
+    clarifyMessage: stringType().optional(),
+    notes: stringType().optional()
+});
+/** Strip the "@mint" mention to see if the comment carried real instructions. */
 function isBareMintMention(comment) {
     const stripped = comment
         .replace(/@mint\b/gi, "")
@@ -41298,28 +41312,19 @@ function isBareMintMention(comment) {
     return stripped.length === 0;
 }
 async function parseCommentMission(input) {
-    const maxFlows = input.maxFlows ?? 5;
+    const maxFlows = input.maxFlows ?? 3;
     if (isBareMintMention(input.comment)) {
         return {
+            mode: "fallback",
             flows: [],
             notes: "Bare @mint mention — falling back to PR-diff QA.",
-            fallbackToPrDiff: true,
             inputTokens: 0,
             outputTokens: 0
         };
     }
     const catalogIds = new Set(input.flows.map((flow) => flow.id));
-    if (catalogIds.size === 0) {
-        return {
-            flows: [],
-            notes: "No recorded flows exist yet. Run `mint record` or `mint generate` first.",
-            fallbackToPrDiff: false,
-            inputTokens: 0,
-            outputTokens: 0
-        };
-    }
-    const appFiles = input.changedFiles ? filterAppFiles(input.changedFiles) : [];
     const personaIds = Object.keys(input.config.auth.personas);
+    const appFiles = input.changedFiles ? filterAppFiles(input.changedFiles) : [];
     const prompt = buildParsePrompt({
         comment: input.comment,
         flows: input.flows,
@@ -41336,53 +41341,98 @@ async function parseCommentMission(input) {
     });
     const raw = parseLlmJson(llmResult.text);
     const parsed = parseResponseSchema.parse(raw);
-    // Defense in depth: even if the system prompt was clear, drop any flow id
-    // that isn't in the catalog and report it as rejected.
-    const rejected = [...(parsed.rejected ?? [])];
-    const validFlows = [];
-    const seen = new Set();
-    for (const flow of parsed.flows) {
-        if (!catalogIds.has(flow.id)) {
-            rejected.push(`Unknown flow id "${flow.id}" (not in catalog).`);
-            continue;
+    if (parsed.mode === "match") {
+        const validFlows = [];
+        const seen = new Set();
+        for (const flow of parsed.flows) {
+            if (!catalogIds.has(flow.id))
+                continue;
+            if (seen.has(flow.id))
+                continue;
+            seen.add(flow.id);
+            if (flow.persona && !personaIds.includes(flow.persona)) {
+                const { persona: _ignored, ...withoutPersona } = flow;
+                validFlows.push(withoutPersona);
+            }
+            else {
+                validFlows.push(flow);
+            }
         }
-        if (seen.has(flow.id))
-            continue;
-        seen.add(flow.id);
-        // Drop persona overrides that don't exist; the recorded persona is the safe fallback.
-        if (flow.persona && !personaIds.includes(flow.persona)) {
-            rejected.push(`Unknown persona "${flow.persona}" for flow "${flow.id}" (using recorded persona instead).`);
-            const { persona: _ignored, ...withoutPersona } = flow;
-            validFlows.push(withoutPersona);
+        // If the model said "match" but none of the ids actually exist in the catalog,
+        // fall through to "generate" so the user still gets a useful run.
+        if (validFlows.length === 0) {
+            return {
+                mode: "generate",
+                flows: [],
+                generate: {
+                    testIntent: input.comment.replace(/@mint\b/gi, "").trim() || "Test what the user described in the comment.",
+                    persona: undefined,
+                    relatedRoutes: []
+                },
+                notes: parsed.notes ?? "No matching recorded flow; generating one from the comment.",
+                inputTokens: llmResult.inputTokens,
+                outputTokens: llmResult.outputTokens
+            };
         }
-        else {
-            validFlows.push(flow);
-        }
+        return {
+            mode: "match",
+            flows: validFlows.slice(0, maxFlows),
+            notes: parsed.notes,
+            inputTokens: llmResult.inputTokens,
+            outputTokens: llmResult.outputTokens
+        };
     }
+    if (parsed.mode === "generate") {
+        const brief = parsed.generate ?? {
+            testIntent: input.comment.replace(/@mint\b/gi, "").trim() || "Test what the user described."
+        };
+        if (brief.persona && !personaIds.includes(brief.persona)) {
+            brief.persona = undefined;
+        }
+        return {
+            mode: "generate",
+            flows: [],
+            generate: brief,
+            notes: parsed.notes,
+            inputTokens: llmResult.inputTokens,
+            outputTokens: llmResult.outputTokens
+        };
+    }
+    if (parsed.mode === "clarify") {
+        return {
+            mode: "clarify",
+            flows: [],
+            clarifyMessage: parsed.clarifyMessage ?? "I couldn't tell what to test. Try describing one flow in plain English (e.g. \"test that the signup form rejects invalid emails\").",
+            notes: parsed.notes,
+            inputTokens: llmResult.inputTokens,
+            outputTokens: llmResult.outputTokens
+        };
+    }
+    // mode === "fallback"
     return {
-        flows: validFlows.slice(0, maxFlows),
+        mode: "fallback",
+        flows: [],
         notes: parsed.notes,
-        rejected: rejected.length ? rejected : undefined,
-        fallbackToPrDiff: parsed.fallbackToPrDiff,
         inputTokens: llmResult.inputTokens,
         outputTokens: llmResult.outputTokens
     };
 }
 function buildParsePrompt(input) {
-    const flowCatalog = input.flows
-        .map((flow) => {
-        const steps = flow.steps.slice(0, 3).map((step) => `      - ${step.intent || step.type}`).join("\n");
-        return `  - id: ${flow.id}
+    const flowCatalog = input.flows.length
+        ? input.flows
+            .map((flow) => {
+            const steps = flow.steps.slice(0, 3).map((step) => `      - ${step.intent || step.type}`).join("\n");
+            return `  - id: ${flow.id}
     name: ${flow.name}
     featureId: ${flow.featureId}
     recordedPersona: ${flow.persona}
-    preconditions: [${flow.preconditions.join(", ")}]
     relatedRoutes: [${flow.relatedRoutes.join(", ")}]
     relatedFiles: [${flow.relatedFiles.slice(0, 6).join(", ")}]
     firstSteps:
 ${steps || "      (no steps recorded)"}`;
-    })
-        .join("\n\n");
+        })
+            .join("\n\n")
+        : "  (no recorded flows yet — you should likely choose mode=\"generate\")";
     const featureSummary = (input.productMap?.features ?? [])
         .slice(0, 20)
         .map((feature) => `  - ${feature.id}: ${feature.name} (routes: ${feature.routes.join(", ")})`)
@@ -41401,20 +41451,183 @@ Available personas: ${personas}
 App features:
 ${featureSummary}
 
-Flow catalog (these are the ONLY ids you may return):
+Recorded flows:
 
 ${flowCatalog}
 ${diffBlock}
 
-Pick up to ${input.maxFlows} flows. Return JSON matching:
+Pick a mode and respond in JSON:
 ${RESPONSE_JSON_SHAPE}
 
-Hard rules:
-- Every "id" you return must appear in the flow catalog above. Unknown ids belong in "rejected", not "flows".
-- Only set "persona" when the developer explicitly named one of: ${personas}. Otherwise omit it.
-- If the comment is bare "@mint" with no further instruction, set fallbackToPrDiff: true and leave flows empty.
-- If the developer says "test all", return every catalog flow id (up to ${input.maxFlows}).
-- Sort flows by descending confidence.`;
+Rules:
+- Prefer mode="match" only if a recorded flow OBVIOUSLY covers what the developer asked for. When in doubt, use "generate".
+- For mode="generate", make testIntent specific and actionable — describe the user-visible steps (click X, fill Y, verify Z).
+- Only set persona if the developer explicitly named one of: ${personas}.
+- mode="clarify" only when the comment is meaningless even with context (e.g. "@mint do the thing").
+- Sort matched flows by descending confidence. Cap at ${input.maxFlows}.`;
+}
+
+;// CONCATENATED MODULE: ../engine/dist/generate-from-intent.js
+
+
+const SYSTEM = (/* unused pure expression or super */ null && (`You are a test designer for Mint — a Playwright-based semantic test runner.
+
+A developer asked you in plain English to test a specific user flow. You design exactly ONE flow to validate what they described.
+
+Inputs you receive:
+- The developer's testIntent (what they want validated, in their words).
+- A list of relevant source files (full contents) where the UI elements live.
+- The app's mint.yml personas + bypasses.
+- The recorded flows already in the catalog (use as format reference; don't duplicate).
+- The product map (routes + features).
+
+Rules:
+- Every preferredLabel MUST appear verbatim in the source files you were shown.
+- Pick a persona whose plan/data satisfies the flow's preconditions.
+- Steps should be small and atomic: navigate, semantic_click, fill, keypress, assert_visible.
+- Include an assert_visible step at the end that proves the requested outcome happened.
+- If the testIntent cannot be exercised through the browser (e.g. internal lib change), return null instead of a flow.`));
+const generate_from_intent_FLOW_JSON_SHAPE = (/* unused pure expression or super */ null && (`{
+  "flow": {
+    "id": "ephemeral.<short_slug>",
+    "name": "Human readable > Specific scenario",
+    "featureId": "<feature_id from product map, or new slug>",
+    "persona": "<persona id from mint.yml>",
+    "preconditions": ["logged_in", ...],
+    "steps": [
+      {
+        "type": "navigate|semantic_click|fill|assert_visible|keypress",
+        "intent": "short human description of what this step does",
+        "preferredLabels": ["EXACT text that appears in the source"],
+        "fallbackRoute": "/optional/route",
+        "fallbackSelectors": ["[data-testid='optional']"],
+        "value": "for fill steps",
+        "key": "for keypress steps"
+      }
+    ],
+    "assertions": [
+      { "type": "visible_control|visible_text|url_includes|no_console_errors", "description": "what this proves", "preferredLabels": ["..."] }
+    ],
+    "relatedRoutes": ["/route"],
+    "relatedFiles": ["frontend/src/..."],
+    "reliabilityScore": 0.7,
+    "averageRunCostUsd": 0
+  },
+  "reason": "1-2 sentences on why these steps prove the developer's request"
+}`));
+const generate_from_intent_stepSchema = objectType({
+    type: enumType(["navigate", "semantic_click", "fill", "assert_visible", "keypress"]),
+    intent: stringType(),
+    preferredLabels: arrayType(stringType()).optional(),
+    fallbackRoute: stringType().optional(),
+    fallbackSelectors: arrayType(stringType()).optional(),
+    value: stringType().optional(),
+    key: stringType().optional()
+});
+const generate_from_intent_assertionSchema = objectType({
+    type: enumType(["visible_text", "visible_control", "url_includes", "no_console_errors"]),
+    description: stringType(),
+    preferredLabels: arrayType(stringType()).optional(),
+    value: stringType().optional()
+});
+const generate_from_intent_flowSchema = objectType({
+    id: stringType().min(1),
+    name: stringType().min(1),
+    featureId: stringType().min(1),
+    persona: stringType().min(1),
+    preconditions: arrayType(stringType()).default([]),
+    steps: arrayType(generate_from_intent_stepSchema).min(1),
+    assertions: arrayType(generate_from_intent_assertionSchema).default([]),
+    relatedRoutes: arrayType(stringType()).default([]),
+    relatedFiles: arrayType(stringType()).default([]),
+    reliabilityScore: numberType().default(0.5),
+    averageRunCostUsd: numberType().default(0)
+});
+const responseSchema = objectType({
+    flow: generate_from_intent_flowSchema.nullable(),
+    reason: stringType().default("")
+});
+async function generateFlowFromIntent(input) {
+    const prompt = buildPrompt({
+        config: input.config,
+        productMap: input.productMap,
+        existingFlows: input.existingFlows,
+        testIntent: input.testIntent,
+        persona: input.persona,
+        relatedRoutes: input.relatedRoutes,
+        sourceCorpus: input.sourceCorpus,
+        diffText: input.diffText
+    });
+    const llmResult = await input.llm({
+        system: SYSTEM,
+        prompt,
+        jsonOnly: true,
+        maxTokens: 16_000
+    });
+    const raw = parseLlmJson(llmResult.text);
+    const parsed = responseSchema.parse(raw);
+    return {
+        flow: parsed.flow,
+        reason: parsed.reason,
+        inputTokens: llmResult.inputTokens,
+        outputTokens: llmResult.outputTokens
+    };
+}
+function buildPrompt(input) {
+    const personas = Object.entries(input.config.auth.personas)
+        .map(([id, p]) => `  - ${id}: plan=${p.plan ?? "none"}, role=${p.role ?? "none"}, seeded_data=${(p.data ?? []).join(",") || "none"}`)
+        .join("\n") || "  (no personas defined)";
+    const bypasses = Object.entries(input.config.bypass)
+        .map(([name, b]) => `  - ${name}: applies_when=${b.applies_when ?? "always"}`)
+        .join("\n") || "  (no bypasses)";
+    const routes = (input.productMap?.routes ?? [])
+        .slice(0, 30)
+        .map((r) => `  - ${r.path} (${r.name})`)
+        .join("\n") || "  (no routes)";
+    const exampleFlow = input.existingFlows[0];
+    const exampleBlock = exampleFlow ? `\nExample of an existing well-formed flow in this repo (for shape only — do NOT duplicate):\n${JSON.stringify({ ...exampleFlow, steps: exampleFlow.steps.slice(0, 3) }, null, 2)}` : "";
+    const fileBlocks = Object.entries(input.sourceCorpus)
+        .map(([file, content]) => `\n--- FILE: ${file} ---\n${generate_from_intent_truncate(content, 12_000)}`)
+        .join("\n");
+    const diffBlock = input.diffText ? `\n\nPR DIFF (for additional context):\n${generate_from_intent_truncate(input.diffText, 12_000)}` : "";
+    const personaHint = input.persona ? `\n\nThe developer asked for persona: ${input.persona}` : "";
+    const routesHint = input.relatedRoutes?.length ? `\n\nThe parser suggested these routes might be relevant: ${input.relatedRoutes.join(", ")}` : "";
+    return `Developer's testIntent:
+"""
+${input.testIntent}
+"""
+
+App: ${input.config.app.name}
+
+Personas:
+${personas}
+
+Bypasses:
+${bypasses}
+
+Routes:
+${routes}
+${personaHint}${routesHint}
+${exampleBlock}
+
+SOURCE FILES:
+${fileBlocks}
+${diffBlock}
+
+Design ONE flow that proves the developer's testIntent works (or doesn't). Return JSON matching:
+${generate_from_intent_FLOW_JSON_SHAPE}
+
+Critical:
+- Every preferredLabel MUST appear verbatim in the SOURCE FILES above.
+- Choose a persona whose plan/data satisfies the flow's preconditions.
+- End with at least one assertion that proves the user-visible outcome.
+- If the intent cannot be tested through a browser (e.g. backend-only change), return { "flow": null, "reason": "..." }.
+- Use a fresh id like "ephemeral.<verb_short_slug>" so it doesn't collide with recorded flows.`;
+}
+function generate_from_intent_truncate(value, max) {
+    if (value.length <= max)
+        return value;
+    return `${value.slice(0, max)}\n... (truncated)`;
 }
 
 ;// CONCATENATED MODULE: ../engine/dist/validation.js
@@ -41533,13 +41746,13 @@ function parse_llm_json_parseLlmJson(text) {
  * Opus can be forced via MINT_JUDGE_MODEL for harder calls.
  */
 const JUDGE_MODEL = process.env.MINT_JUDGE_MODEL ?? "claude-sonnet-4-6";
-const SYSTEM = `You are the runtime judge for Mint, a Playwright-based semantic test runner. You answer narrow yes/no/where questions about what's on a browser page right now. You return strict JSON only — no prose, no markdown.
+const judge_SYSTEM = `You are the runtime judge for Mint, a Playwright-based semantic test runner. You answer narrow yes/no/where questions about what's on a browser page right now. You return strict JSON only — no prose, no markdown.
 
 You are not the test designer; you don't propose alternative test plans. You answer the specific question asked, grounded in the page state given to you. When uncertain, say so explicitly.`;
 async function askJudge(ask, llm) {
-    const prompt = buildPrompt(ask);
+    const prompt = judge_buildPrompt(ask);
     const result = await llm({
-        system: SYSTEM,
+        system: judge_SYSTEM,
         prompt,
         jsonOnly: true,
         maxTokens: 1_500
@@ -41547,7 +41760,7 @@ async function askJudge(ask, llm) {
     const parsed = parse_llm_json_parseLlmJson(result.text);
     return shapeAnswer(ask.kind, parsed);
 }
-function buildPrompt(ask) {
+function judge_buildPrompt(ask) {
     switch (ask.kind) {
         case "where_to_click":
             return `QUESTION: where_to_click
@@ -41685,6 +41898,7 @@ function historyPath(paths, flowId) {
 }
 
 ;// CONCATENATED MODULE: ../engine/dist/index.js
+
 
 
 
@@ -44848,6 +45062,18 @@ async function run() {
         flowsDir: external_node_path_default().join(process.cwd(), ".mint", "flows"),
         runsDir: external_node_path_default().join(process.cwd(), ".mint", "runs")
     };
+    // If the mission carried a full flow object (e.g. a server-generated ephemeral
+    // flow from `@mint test ...`), write it into .mint/flows/<id>.json so the
+    // browser runner can load it the same way it loads recorded flows.
+    const ephFlow = mission.flow;
+    if (ephFlow?.id) {
+        external_node_fs_default().mkdirSync(paths.flowsDir, { recursive: true });
+        const flowFilePath = external_node_path_default().join(paths.flowsDir, `${ephFlow.id}.json`);
+        if (!external_node_fs_default().existsSync(flowFilePath)) {
+            external_node_fs_default().writeFileSync(flowFilePath, JSON.stringify(ephFlow, null, 2));
+            core.info(`Wrote ephemeral flow to ${flowFilePath}`);
+        }
+    }
     const judge = makeJudgeBridge(api, missionId);
     let stepIndex = 0;
     core.info("Running browser mission…");
