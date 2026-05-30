@@ -41482,11 +41482,14 @@ Inputs you receive:
 - The product map (routes + features).
 
 Rules:
-- Every preferredLabel MUST appear verbatim in the source files you were shown.
+- Every preferredLabel MUST appear verbatim in the source files you were shown, AS USER-FACING TEXT — inside JSX like \`>Label<\`, \`placeholder="Label"\`, \`aria-label="Label"\`, \`title="Label"\`, or as the content of a button/anchor. If a string only appears inside a comment, an LLM prompt template, a constant variable, or backend code, it is NOT a real UI label — do not emit it.
+- **EVERY navigate step MUST have a fallbackRoute** (e.g. \`"/article-builder"\`, \`"/settings"\`). Pick the path from the product map's routes list or infer from the route file paths. A navigate step without fallbackRoute will hard-fail the run.
 - Pick a persona whose plan/data satisfies the flow's preconditions.
 - Steps should be small and atomic: navigate, semantic_click, fill, keypress, assert_visible.
-- Include an assert_visible step at the end that proves the requested outcome happened.
-- If the testIntent cannot be exercised through the browser (e.g. internal lib change), return null instead of a flow.`));
+- **DO NOT emit assert_visible BETWEEN interactive steps.** semantic_click and fill already wait for their target elements; an explicit assert in between races the page render and creates flaky failures.
+- Only emit assert_visible as the FINAL step(s), to prove the user-visible outcome of the entire flow.
+- For fill steps: preferredLabels should be the input's placeholder or its associated \`<label>\` text — never a button label.
+- If the testIntent cannot be exercised through the browser (e.g. backend-only change), return null instead of a flow.`));
 const generate_from_intent_FLOW_JSON_SHAPE = (/* unused pure expression or super */ null && (`{
   "flow": {
     "id": "ephemeral.<short_slug>",
@@ -41558,20 +41561,83 @@ async function generateFlowFromIntent(input) {
         sourceCorpus: input.sourceCorpus,
         diffText: input.diffText
     });
-    const llmResult = await input.llm({
+    // First pass.
+    let llmResult = await input.llm({
         system: SYSTEM,
         prompt,
         jsonOnly: true,
         maxTokens: 16_000
     });
-    const raw = parseLlmJson(llmResult.text);
-    const parsed = responseSchema.parse(raw);
+    let parsed = responseSchema.parse(parseLlmJson(llmResult.text));
+    let totalIn = llmResult.inputTokens;
+    let totalOut = llmResult.outputTokens;
+    // Validate the generated flow against the source corpus. If too many labels
+    // are hallucinated or any navigate step is missing fallbackRoute, retry once
+    // with the validation feedback included in the prompt.
+    if (parsed.flow) {
+        const issues = validateGeneratedFlow(parsed.flow, input.sourceCorpus);
+        if (issues.length > 0) {
+            const retryPrompt = `${prompt}\n\nYour previous attempt had these issues — fix them:\n${issues.map((i) => `- ${i}`).join("\n")}\n\nReturn the same JSON shape but with the issues addressed.`;
+            llmResult = await input.llm({
+                system: SYSTEM,
+                prompt: retryPrompt,
+                jsonOnly: true,
+                maxTokens: 16_000
+            });
+            try {
+                parsed = responseSchema.parse(parseLlmJson(llmResult.text));
+            }
+            catch {
+                // Second pass failed to parse — stick with the first pass's flow but
+                // emit the issues into the reason so the caller can decide.
+            }
+            totalIn += llmResult.inputTokens;
+            totalOut += llmResult.outputTokens;
+        }
+    }
     return {
         flow: parsed.flow,
         reason: parsed.reason,
-        inputTokens: llmResult.inputTokens,
-        outputTokens: llmResult.outputTokens
+        inputTokens: totalIn,
+        outputTokens: totalOut
     };
+}
+/** Return a list of human-readable issues, or [] if the flow looks clean. */
+function validateGeneratedFlow(flow, sourceCorpus) {
+    const issues = [];
+    const allSource = Object.values(sourceCorpus).join("\n");
+    for (let i = 0; i < flow.steps.length; i++) {
+        const step = flow.steps[i];
+        const n = i + 1;
+        if (step.type === "navigate" && !step.fallbackRoute) {
+            issues.push(`Step ${n} is a navigate but has no fallbackRoute. Add one (e.g. "/article-builder").`);
+        }
+        for (const label of step.preferredLabels ?? []) {
+            const trimmed = label.trim();
+            if (!trimmed)
+                continue;
+            // Real UI labels usually appear inside JSX-ish text, placeholders,
+            // aria-labels, titles, button content, etc. We look for a few of those
+            // shapes. False negatives are fine — the goal is to catch obvious cases
+            // where the LLM grabbed text from a comment or prompt template.
+            const patterns = [
+                `>${trimmed}<`,
+                `>{${trimmed}<`,
+                `>{"${trimmed}"`,
+                `placeholder="${trimmed}"`,
+                `placeholder={\`${trimmed}\`}`,
+                `aria-label="${trimmed}"`,
+                `title="${trimmed}"`,
+                `>${trimmed} <`,
+                `>${trimmed}\n`
+            ];
+            const found = patterns.some((p) => allSource.includes(p)) || allSource.includes(`>${trimmed}`); // permissive fallback
+            if (!found) {
+                issues.push(`Step ${n} preferredLabel "${trimmed}" was not found as user-facing text in the source files. Pick a label that actually appears in JSX/placeholder/aria-label/title.`);
+            }
+        }
+    }
+    return issues;
 }
 function buildPrompt(input) {
     const personas = Object.entries(input.config.auth.personas)
@@ -42950,7 +43016,17 @@ function snapshotForVerify(state) {
 }
 async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
     let state = stateIn;
-    if (step.type === "navigate" && step.fallbackRoute) {
+    if (step.type === "navigate") {
+        if (!step.fallbackRoute) {
+            // Fail loudly. Previously this silently skipped, causing every later
+            // step to run against whatever page we happened to be on (usually the
+            // login redirect target), which masked real flow design bugs.
+            return {
+                ok: false,
+                evidence: `Navigate step "${step.intent}" had no fallbackRoute. Cannot determine where to go.`,
+                suggestedFix: "Add fallbackRoute to the navigate step (e.g. \"/article-builder\")."
+            };
+        }
         const url = absoluteUrl(config.app.base_url, step.fallbackRoute);
         await page.goto(url, { waitUntil: "domcontentloaded" });
         await addActionStep(page, config, runDir, steps, `Navigated to ${url} for "${step.intent}".`, step.intent);
