@@ -45424,14 +45424,35 @@ async function run() {
                 apiKey
             });
             core.info(`Video uploaded: ${videoUrl}`);
-            // Generate and upload animated GIF preview using system ffmpeg
-            // (installed by the composite wrapper via apt-get).
+            // Generate animated GIF preview. GitHub's image proxy (camo) refuses to
+            // render images over ~5 MB inline, so we encode tight and retry smaller
+            // if the first attempt overshoots. Long wizard journeys would otherwise
+            // produce 7–10 MB GIFs that show as broken in the sticky comment.
             try {
                 const gifPath = "/tmp/mint-preview.gif";
-                core.info("Generating animated GIF preview…");
-                (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -ss 4 -i "${videoPath}" -vf "fps=4,scale=720:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=sierra2_4a" -loop 0 "${gifPath}"`, { stdio: "pipe" });
+                const GH_LIMIT = 4_500_000; // headroom under camo's ~5 MB cap
+                // Each preset: fps, width, colors, duration cap. Step down on overflow.
+                const presets = [
+                    { fps: 4, w: 720, colors: 128, dur: 120 },
+                    { fps: 3, w: 560, colors: 96, dur: 90 },
+                    { fps: 2, w: 480, colors: 64, dur: 60 }
+                ];
+                let chosen = null;
+                for (const p of presets) {
+                    core.info(`Generating animated GIF preview (fps=${p.fps}, w=${p.w}, colors=${p.colors}, dur=${p.dur}s)…`);
+                    (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -ss 4 -t ${p.dur} -i "${videoPath}" -vf "fps=${p.fps},scale=${p.w}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=${p.colors}[p];[s1][p]paletteuse=dither=sierra2_4a" -loop 0 "${gifPath}"`, { stdio: "pipe" });
+                    if (!external_node_fs_default().existsSync(gifPath))
+                        break;
+                    const size = external_node_fs_default().statSync(gifPath).size;
+                    if (size <= GH_LIMIT) {
+                        chosen = { size, preset: p };
+                        break;
+                    }
+                    core.info(`GIF too large (${(size / 1048576).toFixed(2)} MB > ${(GH_LIMIT / 1048576).toFixed(1)} MB), retrying smaller.`);
+                    chosen = { size, preset: p }; // keep last attempt as fallback
+                }
                 if (external_node_fs_default().existsSync(gifPath)) {
-                    core.info("Uploading GIF preview…");
+                    core.info(`Uploading GIF preview (${chosen ? (chosen.size / 1048576).toFixed(2) : "?"} MB)…`);
                     previewUrl = await uploadMedia({
                         runId: missionId,
                         filename: "preview.gif",
