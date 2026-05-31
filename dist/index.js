@@ -43199,7 +43199,7 @@ async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
             await waitForAnyLabel(page, labels, clickTimeoutMs);
         }
         state = await observePage(page, [], [], steps.at(-1));
-        const match = findElementByLabels(state, labels);
+        const match = findElementByLabels(state, labels, "click");
         if (match) {
             const locator = page.locator(match.selector).first();
             // Bail out before the 5s click timeout if the element is clearly disabled.
@@ -43273,9 +43273,9 @@ async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
             await waitForAnyLabel(page, labels, fillTimeoutMs);
         }
         state = await observePage(page, [], [], steps.at(-1));
-        const match = findElementByLabels(state, labels) ?? state.inputs[0];
+        const match = findElementByLabels(state, labels, "fill") ?? state.inputs[0];
         if (!match || !step.value)
-            return { ok: false, evidence: `Could not fill "${step.intent}".`, suggestedFix: "Add a preferred label or value to this flow step." };
+            return { ok: false, evidence: `Could not fill "${step.intent}". Visible inputs on page: ${state.inputs.slice(0, 6).map((i) => `"${i.label}"`).join(", ") || "(none)"}.`, suggestedFix: "Pick a preferredLabel that matches an actual input on this page." };
         await page.locator(match.selector).first().fill(renderTemplate(step.value, { run_id: Date.now().toString() }));
         await addActionStep(page, config, runDir, steps, `Filled "${match.label}" for "${step.intent}".`, step.intent);
         return { ok: true, evidence: `Filled ${match.label}.` };
@@ -43446,9 +43446,15 @@ async function applyBypasses(page, config, preconditions = []) {
         }
     }
 }
-function findElementByLabels(state, labels) {
-    const elements = state.buttons.concat(state.links, state.inputs);
-    return elements.find((element) => labels.some((label) => labelMatches(element.label, label)));
+function findElementByLabels(state, labels, kind) {
+    // Constrain the search pool by step kind so a `fill` step doesn't match a
+    // button (Playwright errors on fill() against non-input elements).
+    const pool = kind === "fill"
+        ? state.inputs
+        : kind === "click"
+            ? state.buttons.concat(state.links)
+            : state.buttons.concat(state.links, state.inputs);
+    return pool.find((element) => labels.some((label) => labelMatches(element.label, label)));
 }
 /**
  * Poll the live page for any of the given labels to appear as visible text or
