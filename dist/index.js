@@ -41487,9 +41487,11 @@ Rules:
 - If the user reaches a page by CLICKING a link/button (not by typing a URL), use \`semantic_click\` instead — not \`navigate\`.
 - Pick a persona whose plan/data satisfies the flow's preconditions.
 - Steps should be small and atomic: navigate, semantic_click, fill, keypress, assert_visible.
+- **If the intent involves REACHING a later state of a multi-step UI** (e.g. "reach the outline step", "complete checkout", "submit the form"), emit ALL the intermediate steps explicitly — fill each required field, click each next/continue button. Don't assume the wizard auto-advances. 6–12 steps is normal for a wizard journey; 2 steps is almost always wrong for these intents.
 - **DO NOT emit assert_visible BETWEEN interactive steps.** semantic_click and fill already wait for their target elements; an explicit assert in between races the page render and creates flaky failures.
 - Only emit assert_visible as the FINAL step(s), to prove the user-visible outcome of the entire flow.
 - For fill steps: preferredLabels should be the input's placeholder or its associated \`<label>\` text — never a button label.
+- For final assertions: prefer \`visible_control\` / \`visible_text\` over \`url_includes\`. URLs often change unpredictably (query params, fragments). Visible text/controls are stable proofs the user actually reached the target state.
 - If the testIntent cannot be exercised through the browser (e.g. backend-only change), return null instead of a flow.`));
 const generate_from_intent_FLOW_JSON_SHAPE = (/* unused pure expression or super */ null && (`{
   "flow": {
@@ -41659,7 +41661,7 @@ function buildPrompt(input) {
     const exampleFlow = input.existingFlows[0];
     const exampleBlock = exampleFlow ? `\nExample of an existing well-formed flow in this repo (for shape only — do NOT duplicate):\n${JSON.stringify({ ...exampleFlow, steps: exampleFlow.steps.slice(0, 3) }, null, 2)}` : "";
     const fileBlocks = Object.entries(input.sourceCorpus)
-        .map(([file, content]) => `\n--- FILE: ${file} ---\n${smartTruncate(content, 80_000)}`)
+        .map(([file, content]) => `\n--- FILE: ${file} ---\n${smartTruncate(content, 150_000)}`)
         .join("\n");
     const diffBlock = input.diffText ? `\n\nPR DIFF (for additional context):\n${generate_from_intent_truncate(input.diffText, 16_000)}` : "";
     const personaHint = input.persona ? `\n\nThe developer asked for persona: ${input.persona}` : "";
@@ -42980,7 +42982,7 @@ function generateCandidateActions(state) {
     candidates.push({ id: `action_${index++}`, type: "keypress", key: "Escape", category: "dismiss_overlay", confidence: 0.75 });
     return candidates;
 }
-const MAX_REPLANS = 6;
+const MAX_REPLANS = 10;
 /**
  * When a step misses, ask the LLM to look at the actual current page and
  * propose 1-3 alternative steps that advance toward the original intent.
