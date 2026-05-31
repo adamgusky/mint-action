@@ -43064,6 +43064,10 @@ Respond ONLY with valid JSON matching this shape:
         return [];
     if (!Array.isArray(parsed.steps))
         return [];
+    // Loading-state labels never make stable targets — the indicator disappears
+    // the moment the work it represents finishes, so any step targeting them
+    // races the page and usually loses.
+    const isLoadingLabel = (s) => /^(generating|loading|submitting|saving|processing|please wait|working)(\s*[.…])*$/i.test(s.trim());
     const valid = [];
     for (const s of parsed.steps) {
         if (!s || typeof s !== "object")
@@ -43074,10 +43078,13 @@ Respond ONLY with valid JSON matching this shape:
             continue;
         if (type === "navigate" && !step.fallbackRoute)
             continue;
+        const preferredLabels = Array.isArray(step.preferredLabels) ? step.preferredLabels.map(String) : undefined;
+        if (preferredLabels && preferredLabels.length > 0 && preferredLabels.every(isLoadingLabel))
+            continue;
         valid.push({
             type,
             intent: String(step.intent ?? "replan step"),
-            preferredLabels: Array.isArray(step.preferredLabels) ? step.preferredLabels.map(String) : undefined,
+            preferredLabels: preferredLabels?.filter((l) => !isLoadingLabel(l)),
             fallbackRoute: typeof step.fallbackRoute === "string" ? step.fallbackRoute : undefined,
             fallbackSelectors: Array.isArray(step.fallbackSelectors) ? step.fallbackSelectors.map(String) : undefined,
             value: typeof step.value === "string" ? step.value : undefined,
@@ -43292,7 +43299,7 @@ async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
         // async (animations, lazy components, timed message reveals); a stale
         // snapshot misses content that appears 100ms after observation.
         const labels = step.preferredLabels ?? [];
-        const timeoutMs = config.limits.assert_visible_timeout_ms ?? 8000;
+        const timeoutMs = config.limits.assert_visible_timeout_ms ?? 20000;
         const ok = await waitForAnyLabel(page, labels, timeoutMs);
         return {
             ok,
