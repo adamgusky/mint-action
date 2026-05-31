@@ -42677,7 +42677,13 @@ async function runBrowserMission(options) {
         });
         await applyBypasses(page, options.config, flow.preconditions);
         await loginIfConfigured(page, options.config, options.mission.persona);
-        const replay = await replayFlow(page, options.config, flow, runDir, steps, evidence, consoleErrors, networkErrors, { llm: options.llm });
+        // Pull route hints off the mission so replans can navigate to real URLs
+        // when the agent ends up on the wrong page.
+        const missionAny = options.mission;
+        const replay = await replayFlow(page, options.config, flow, runDir, steps, evidence, consoleErrors, networkErrors, {
+            llm: options.llm,
+            routes: missionAny.routes
+        });
         await pauseForVideo(page, options.config, "final");
         await context.close();
         context = undefined;
@@ -43005,6 +43011,9 @@ ${promptList(state.inputs, 15)}
   visible text (first 30 lines):
 ${state.visibleText.slice(0, 30).map((t) => `  - ${truncate(t, 120)}`).join("\n")}
 
+KNOWN APP ROUTES (use these in fallbackRoute for navigate steps if the current page is wrong):
+${(input.knownRoutes ?? []).slice(0, 40).map((r) => `  - ${r.path}${r.name ? `  (${r.name})` : ""}`).join("\n") || "  (no route map available)"}
+
 Decide what 1-3 next steps would advance the test from THIS page state toward the original intent. Use ONLY labels/text that appear in the page state above. If the page shows nothing relevant (wrong URL, blocked by an unexpected modal, etc.), include a navigate step first OR set "giveUp": true.
 
 Respond ONLY with valid JSON matching this shape:
@@ -43107,7 +43116,8 @@ async function replayFlow(page, config, flow, runDir, steps, evidence, consoleEr
                     failedStepIntent: step.intent,
                     failureReason: result.evidence,
                     state: currentState,
-                    llm: replayContext.llm
+                    llm: replayContext.llm,
+                    knownRoutes: replayContext.routes
                 });
                 if (newSteps.length > 0) {
                     evidence.push(`Replan ${replansUsed + 1}/${MAX_REPLANS}: step "${step.intent}" missed (${result.evidence.slice(0, 120)}); LLM proposed ${newSteps.length} alternative step(s).`);
@@ -43191,7 +43201,26 @@ async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
         state = await observePage(page, [], [], steps.at(-1));
         const match = findElementByLabels(state, labels);
         if (match) {
-            await page.locator(match.selector).first().click({ timeout: 5000 });
+            const locator = page.locator(match.selector).first();
+            // Bail out before the 5s click timeout if the element is clearly disabled.
+            // The empty-input list is the SIGNAL the replan LLM needs to know it
+            // has to fill more fields first (instead of retrying the disabled click).
+            try {
+                const enabled = await locator.isEnabled({ timeout: 1500 });
+                if (!enabled) {
+                    const emptyInputs = state.inputs.filter((i) => i.label && i.label.trim().length > 0).slice(0, 8);
+                    const empties = emptyInputs.map((i) => `"${i.label}"`).join(", ");
+                    return {
+                        ok: false,
+                        evidence: `Click target "${match.label}" is currently disabled. Likely waiting on required fields. Visible inputs: ${empties || "(none detected)"}`,
+                        suggestedFix: "Fill the required fields above before clicking this control."
+                    };
+                }
+            }
+            catch {
+                /* if isEnabled itself fails, just try the click and let it error normally */
+            }
+            await locator.click({ timeout: 5000 });
             await addActionStep(page, config, runDir, steps, `Clicked "${match.label}" for "${step.intent}".`, step.intent);
             return { ok: true, evidence: `Clicked ${match.label}.` };
         }
