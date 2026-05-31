@@ -41483,7 +41483,8 @@ Inputs you receive:
 
 Rules:
 - Every preferredLabel MUST appear verbatim in the source files you were shown, AS USER-FACING TEXT — inside JSX like \`>Label<\`, \`placeholder="Label"\`, \`aria-label="Label"\`, \`title="Label"\`, or as the content of a button/anchor. If a string only appears inside a comment, an LLM prompt template, a constant variable, or backend code, it is NOT a real UI label — do not emit it.
-- **EVERY navigate step MUST have a fallbackRoute** (e.g. \`"/article-builder"\`, \`"/settings"\`). Pick the path from the product map's routes list or infer from the route file paths. A navigate step without fallbackRoute will hard-fail the run.
+- **\`navigate\` is for direct URL navigation ONLY.** It loads a URL via \`page.goto()\` — it does NOT click anything. The step type \`navigate\` REQUIRES a \`fallbackRoute\` (e.g. \`"/article-builder"\`, \`"/settings"\`) and MUST NOT have \`preferredLabels\`. Pick the path from the product map's routes list or infer it from the route file paths.
+- If the user reaches a page by CLICKING a link/button (not by typing a URL), use \`semantic_click\` instead — not \`navigate\`.
 - Pick a persona whose plan/data satisfies the flow's preconditions.
 - Steps should be small and atomic: navigate, semantic_click, fill, keypress, assert_visible.
 - **DO NOT emit assert_visible BETWEEN interactive steps.** semantic_click and fill already wait for their target elements; an explicit assert in between races the page render and creates flaky failures.
@@ -41609,8 +41610,13 @@ function validateGeneratedFlow(flow, sourceCorpus) {
     for (let i = 0; i < flow.steps.length; i++) {
         const step = flow.steps[i];
         const n = i + 1;
-        if (step.type === "navigate" && !step.fallbackRoute) {
-            issues.push(`Step ${n} is a navigate but has no fallbackRoute. Add one (e.g. "/article-builder").`);
+        if (step.type === "navigate") {
+            if (!step.fallbackRoute) {
+                issues.push(`Step ${n} is a navigate but has no fallbackRoute. Either add fallbackRoute (e.g. "/article-builder") or change the step type to semantic_click if the user reaches the page by clicking.`);
+            }
+            if (step.preferredLabels && step.preferredLabels.length > 0) {
+                issues.push(`Step ${n} is a navigate but has preferredLabels — navigate does not click anything. Use semantic_click instead, or remove preferredLabels.`);
+            }
         }
         for (const label of step.preferredLabels ?? []) {
             const trimmed = label.trim();
@@ -41653,9 +41659,9 @@ function buildPrompt(input) {
     const exampleFlow = input.existingFlows[0];
     const exampleBlock = exampleFlow ? `\nExample of an existing well-formed flow in this repo (for shape only — do NOT duplicate):\n${JSON.stringify({ ...exampleFlow, steps: exampleFlow.steps.slice(0, 3) }, null, 2)}` : "";
     const fileBlocks = Object.entries(input.sourceCorpus)
-        .map(([file, content]) => `\n--- FILE: ${file} ---\n${generate_from_intent_truncate(content, 12_000)}`)
+        .map(([file, content]) => `\n--- FILE: ${file} ---\n${smartTruncate(content, 80_000)}`)
         .join("\n");
-    const diffBlock = input.diffText ? `\n\nPR DIFF (for additional context):\n${generate_from_intent_truncate(input.diffText, 12_000)}` : "";
+    const diffBlock = input.diffText ? `\n\nPR DIFF (for additional context):\n${generate_from_intent_truncate(input.diffText, 16_000)}` : "";
     const personaHint = input.persona ? `\n\nThe developer asked for persona: ${input.persona}` : "";
     const routesHint = input.relatedRoutes?.length ? `\n\nThe parser suggested these routes might be relevant: ${input.relatedRoutes.join(", ")}` : "";
     return `Developer's testIntent:
@@ -41694,6 +41700,22 @@ function generate_from_intent_truncate(value, max) {
     if (value.length <= max)
         return value;
     return `${value.slice(0, max)}\n... (truncated)`;
+}
+/**
+ * For source files larger than `max`: keep the top (imports, hooks, helpers)
+ * AND the bottom (the `return (<JSX>...)` section is almost always at the end).
+ * Loses the middle, which is usually local handlers — least valuable for
+ * generating browser flows since those use the actual rendered labels.
+ */
+function smartTruncate(value, max) {
+    if (value.length <= max)
+        return value;
+    const headSize = Math.floor(max * 0.4);
+    const tailSize = max - headSize - 200; // leave room for the gap marker
+    const head = value.slice(0, headSize);
+    const tail = value.slice(value.length - tailSize);
+    const skipped = value.length - headSize - tailSize;
+    return `${head}\n\n/* … ${skipped.toLocaleString()} chars elided (middle of file) … */\n\n${tail}`;
 }
 
 ;// CONCATENATED MODULE: ../engine/dist/validation.js
@@ -42952,9 +42974,106 @@ function generateCandidateActions(state) {
     candidates.push({ id: `action_${index++}`, type: "keypress", key: "Escape", category: "dismiss_overlay", confidence: 0.75 });
     return candidates;
 }
+const MAX_REPLANS = 3;
+/**
+ * When a step misses, ask the LLM to look at the actual current page and
+ * propose 1-3 alternative steps that advance toward the original intent.
+ * This is the difference between a brittle script and an adaptive agent.
+ */
+async function replanFromCurrent(input) {
+    const { state } = input;
+    const truncate = (s, n) => (s.length <= n ? s : s.slice(0, n) + "…");
+    const promptList = (items, n) => items.slice(0, n).map((x) => `  - "${truncate(x.label, 80)}"  (${x.selector})`).join("\n") || "  (none)";
+    const prompt = `You are an in-browser test agent. The original test intent is:
+"${input.testIntent}"
+
+Successful steps so far:
+${input.completedIntents.length ? input.completedIntents.map((s, i) => `  ${i + 1}. ${s}`).join("\n") : "  (none yet)"}
+
+The planned next step was:
+  intent: "${input.failedStepIntent}"
+  failure: ${truncate(input.failureReason, 250)}
+
+CURRENT PAGE STATE:
+  url: ${state.url}
+  visible buttons:
+${promptList(state.buttons, 20)}
+  visible links:
+${promptList(state.links, 15)}
+  visible inputs (label/placeholder):
+${promptList(state.inputs, 15)}
+  visible text (first 30 lines):
+${state.visibleText.slice(0, 30).map((t) => `  - ${truncate(t, 120)}`).join("\n")}
+
+Decide what 1-3 next steps would advance the test from THIS page state toward the original intent. Use ONLY labels/text that appear in the page state above. If the page shows nothing relevant (wrong URL, blocked by an unexpected modal, etc.), include a navigate step first OR set "giveUp": true.
+
+Respond ONLY with valid JSON matching this shape:
+{
+  "steps": [
+    { "type": "navigate" | "semantic_click" | "fill" | "assert_visible" | "keypress",
+      "intent": "what this step does",
+      "preferredLabels": ["EXACT label/placeholder text from the page state above"],
+      "fallbackRoute": "/optional/path (REQUIRED for navigate)",
+      "value": "for fill: the value to type",
+      "key": "for keypress: the key" }
+  ],
+  "reasoning": "1 sentence on why these steps work from the current page",
+  "giveUp": false
+}`;
+    let raw;
+    try {
+        const r = await input.llm({
+            system: "You are an adaptive browser-test agent. You replan one to three steps at a time based on what's actually on the page. You never invent labels. You prefer concrete page actions over re-trying failed plans.",
+            prompt,
+            jsonOnly: true,
+            maxTokens: 1500
+        });
+        raw = r.text;
+    }
+    catch {
+        return [];
+    }
+    // Parse defensively — bad JSON shouldn't break the run, just skip replan.
+    let parsed = {};
+    try {
+        const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+        const start = cleaned.indexOf("{");
+        const end = cleaned.lastIndexOf("}");
+        parsed = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned);
+    }
+    catch {
+        return [];
+    }
+    if (parsed.giveUp === true)
+        return [];
+    if (!Array.isArray(parsed.steps))
+        return [];
+    const valid = [];
+    for (const s of parsed.steps) {
+        if (!s || typeof s !== "object")
+            continue;
+        const step = s;
+        const type = step.type;
+        if (!["navigate", "semantic_click", "fill", "assert_visible", "keypress"].includes(type))
+            continue;
+        if (type === "navigate" && !step.fallbackRoute)
+            continue;
+        valid.push({
+            type,
+            intent: String(step.intent ?? "replan step"),
+            preferredLabels: Array.isArray(step.preferredLabels) ? step.preferredLabels.map(String) : undefined,
+            fallbackRoute: typeof step.fallbackRoute === "string" ? step.fallbackRoute : undefined,
+            fallbackSelectors: Array.isArray(step.fallbackSelectors) ? step.fallbackSelectors.map(String) : undefined,
+            value: typeof step.value === "string" ? step.value : undefined,
+            key: typeof step.key === "string" ? step.key : undefined
+        });
+    }
+    return valid.slice(0, 3);
+}
 async function replayFlow(page, config, flow, runDir, steps, evidence, consoleErrors, networkErrors, replayContext) {
     const history = [];
     let judgeCalls = 0;
+    let replansUsed = 0;
     for (let index = 0; index < flow.steps.length && index < config.limits.max_steps; index++) {
         const step = flow.steps[index];
         let state = await observePage(page, consoleErrors, networkErrors, steps.at(-1));
@@ -42976,6 +43095,28 @@ async function replayFlow(page, config, flow, runDir, steps, evidence, consoleEr
         const beforeForVerify = step.type !== "assert_visible" ? snapshotForVerify(state) : undefined;
         const result = await executeStep(page, config, step, state, runDir, steps, replayContext.llm);
         if (!result.ok) {
+            // AGENTIC REPLAN: instead of bailing on the first miss, ask the LLM to
+            // adapt the rest of the plan to what's actually on the page. Cap at
+            // MAX_REPLANS so a runaway loop can't blow up cost.
+            const completedIntents = flow.steps.slice(0, index).map((s) => s.intent);
+            const currentState = await observePage(page, consoleErrors, networkErrors, steps.at(-1));
+            if (replansUsed < MAX_REPLANS) {
+                const newSteps = await replanFromCurrent({
+                    testIntent: flow.name || flow.id,
+                    completedIntents,
+                    failedStepIntent: step.intent,
+                    failureReason: result.evidence,
+                    state: currentState,
+                    llm: replayContext.llm
+                });
+                if (newSteps.length > 0) {
+                    evidence.push(`Replan ${replansUsed + 1}/${MAX_REPLANS}: step "${step.intent}" missed (${result.evidence.slice(0, 120)}); LLM proposed ${newSteps.length} alternative step(s).`);
+                    flow.steps.splice(index, 1, ...newSteps);
+                    replansUsed++;
+                    index--; // retry from this position with the new first replan step
+                    continue;
+                }
+            }
             evidence.push(result.evidence);
             return { ok: false, blocked: true, suggestedFix: result.suggestedFix, judgeCalls, failingStepIndex: index, failingStepIntent: step.intent };
         }
