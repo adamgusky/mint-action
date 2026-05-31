@@ -42980,7 +42980,7 @@ function generateCandidateActions(state) {
     candidates.push({ id: `action_${index++}`, type: "keypress", key: "Escape", category: "dismiss_overlay", confidence: 0.75 });
     return candidates;
 }
-const MAX_REPLANS = 3;
+const MAX_REPLANS = 6;
 /**
  * When a step misses, ask the LLM to look at the actual current page and
  * propose 1-3 alternative steps that advance toward the original intent.
