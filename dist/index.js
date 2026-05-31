@@ -42991,7 +42991,7 @@ const MAX_REPLANS = 10;
 async function replanFromCurrent(input) {
     const { state } = input;
     const truncate = (s, n) => (s.length <= n ? s : s.slice(0, n) + "…");
-    const promptList = (items, n) => items.slice(0, n).map((x) => `  - "${truncate(x.label, 80)}"  (${x.selector})`).join("\n") || "  (none)";
+    const promptList = (items, n) => items.slice(0, n).map((x) => `  - "${truncate(x.label, 80)}"  (${x.selector})${x.enabled === false ? "  [DISABLED]" : ""}`).join("\n") || "  (none)";
     const prompt = `You are an in-browser test agent. The original test intent is:
 "${input.testIntent}"
 
@@ -43016,7 +43016,12 @@ ${state.visibleText.slice(0, 30).map((t) => `  - ${truncate(t, 120)}`).join("\n"
 KNOWN APP ROUTES (use these in fallbackRoute for navigate steps if the current page is wrong):
 ${(input.knownRoutes ?? []).slice(0, 40).map((r) => `  - ${r.path}${r.name ? `  (${r.name})` : ""}`).join("\n") || "  (no route map available)"}
 
-Decide what 1-3 next steps would advance the test from THIS page state toward the original intent. Use ONLY labels/text that appear in the page state above. If the page shows nothing relevant (wrong URL, blocked by an unexpected modal, etc.), include a navigate step first OR set "giveUp": true.
+Decide what 1-3 next steps would advance the test from THIS page state toward the original intent. Use ONLY labels/text that appear in the page state above.
+
+IMPORTANT:
+- NEVER target a button marked [DISABLED] — it's a loading state ("Generating…", "Submitting…") or gating control. If the only forward control is disabled, the page is busy: prefer a short assert_visible step to confirm the target state arrives, or set giveUp:true.
+- If the test intent is already satisfied by what's visible (e.g. intent was "reach the outline step" and the outline UI is on screen), set "giveUp": true with reasoning "intent already satisfied". Don't pile on extra clicks.
+- If the page shows nothing relevant (wrong URL, blocked by an unexpected modal), include a navigate step first.
 
 Respond ONLY with valid JSON matching this shape:
 {
@@ -43456,7 +43461,12 @@ function findElementByLabels(state, labels, kind) {
         : kind === "click"
             ? state.buttons.concat(state.links)
             : state.buttons.concat(state.links, state.inputs);
-    return pool.find((element) => labels.some((label) => labelMatches(element.label, label)));
+    // Prefer enabled matches — picking a disabled loading-state button (e.g.
+    // "Generating…") wastes the click and clouds error reporting. Fall back to
+    // disabled only if no enabled match exists (so we still surface the useful
+    // "this control is disabled" signal in semantic_click).
+    const matches = pool.filter((element) => labels.some((label) => labelMatches(element.label, label)));
+    return matches.find((e) => e.enabled) ?? matches[0];
 }
 /**
  * Poll the live page for any of the given labels to appear as visible text or
