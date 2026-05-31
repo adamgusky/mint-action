@@ -43234,9 +43234,46 @@ async function executeStep(page, config, step, stateIn, runDir, steps, llm) {
             catch {
                 /* if isEnabled itself fails, just try the click and let it error normally */
             }
-            await locator.click({ timeout: 5000 });
-            await addActionStep(page, config, runDir, steps, `Clicked "${match.label}" for "${step.intent}".`, step.intent);
-            return { ok: true, evidence: `Clicked ${match.label}.` };
+            try {
+                await locator.click({ timeout: 5000 });
+                await addActionStep(page, config, runDir, steps, `Clicked "${match.label}" for "${step.intent}".`, step.intent);
+                return { ok: true, evidence: `Clicked ${match.label}.` };
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                // Modal/overlay interception is the dominant click-timeout cause on
+                // modern apps — generation-result modals, confirmation dialogs,
+                // toast-as-modal patterns all attach a `fixed inset-0` backdrop with
+                // a high z-index. The button under it is "visible, enabled, stable"
+                // per Playwright, just unclickable. Two recovery moves:
+                //   1. Press Escape and retry the original click (cheap, often works).
+                //   2. If the modal is still up, surface its contents so replan can
+                //      target a control INSIDE the modal instead.
+                if (/intercepts pointer events/i.test(msg)) {
+                    await page.keyboard.press("Escape").catch(() => undefined);
+                    await page.waitForTimeout(400);
+                    const stillBlocked = await page.locator('div[class*="inset-0"][class*="z-"], [role="dialog"], [aria-modal="true"]').first().isVisible({ timeout: 250 }).catch(() => false);
+                    if (!stillBlocked) {
+                        try {
+                            await locator.click({ timeout: 5000 });
+                            await addActionStep(page, config, runDir, steps, `Clicked "${match.label}" for "${step.intent}" (after dismissing overlay).`, step.intent);
+                            return { ok: true, evidence: `Clicked ${match.label} after pressing Escape to clear an overlay.` };
+                        }
+                        catch { /* fall through to evidence path */ }
+                    }
+                    // Snapshot interactive controls visible INSIDE the modal so replan
+                    // can pick one (e.g. "Close", "Generate", "Save and continue").
+                    const modalState = await observePage(page, [], [], steps.at(-1));
+                    const modalButtons = modalState.buttons.filter((b) => b.label && b.enabled).slice(0, 8).map((b) => `"${b.label}"`).join(", ");
+                    const modalInputs = modalState.inputs.filter((i) => i.label).slice(0, 5).map((i) => `"${i.label}"`).join(", ");
+                    return {
+                        ok: false,
+                        evidence: `Click "${match.label}" was intercepted by a modal/overlay. Modal buttons: ${modalButtons || "(none detected)"}. Modal inputs: ${modalInputs || "(none)"}. Target a control INSIDE the modal, or press Escape, instead of the page underneath.`,
+                        suggestedFix: "Interact with the modal's own controls before reaching the page underneath."
+                    };
+                }
+                throw err;
+            }
         }
         for (const selector of step.fallbackSelectors ?? []) {
             const locator = page.locator(selector).first();
