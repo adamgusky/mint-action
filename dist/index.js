@@ -45422,11 +45422,15 @@ async function run() {
             }
         }
     }
-    // Source step intents from the flow definition (always present) and pair
-    // with screenshot URLs we just uploaded. result.steps is sometimes empty
-    // even on success so this is more reliable.
+    // ALWAYS source from result.steps (the actual executed action log,
+    // captured at the moment each screenshot was taken). The original
+    // mission.flow.steps is the LLM's pre-run plan — runtime replans
+    // splice/replace steps, so plan-vs-screenshot pairing drifts and the
+    // comment ends up describing the plan instead of what ran.
     const flowSteps = (mission.flow?.steps ?? []);
-    const stepsToPost = flowSteps.length > 0 ? flowSteps.map((s, i) => ({ index: i + 1, intent: s.intent ?? `Step ${i + 1}`, type: s.type ?? "action" })) : result.steps.map((s, i) => ({ index: i + 1, intent: s, type: "action" }));
+    const stepsToPost = result.steps.length > 0
+        ? result.steps.map((s, i) => ({ index: i + 1, intent: s, type: "action" }))
+        : flowSteps.map((s, i) => ({ index: i + 1, intent: s.intent ?? `Step ${i + 1}`, type: s.type ?? "action" }));
     const stepStatus = result.status === "passed" ? "ok" : "executed";
     for (const s of stepsToPost) {
         await api.postStep(missionId, {
