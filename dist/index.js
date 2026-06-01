@@ -42841,11 +42841,15 @@ OPERATING PRINCIPLES
 - You are stateless across turns: each turn you only see the tool results so far. Always peek the page before deciding what to do next when you're unsure of the current state.
 - Multi-step UIs are normal. Wizards, modals, expand/collapse panels, tabs inside settings pages, async backend work that takes 5-30s to finish — assume all of these. After clicking a control that triggers work, peek again to see what changed before doing the next thing.
 - Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section (e.g. "image settings" inside /settings), peek and click the visible nav/tab. Tabs and sidebar items are normal UI — they show up as buttons/links in peek output.
-- Disabled controls = the app is waiting on something. If a primary button is disabled, find the required input(s) above and fill them first.
+- **NEVER use press_key for navigation.** No Tab, PageDown, End, Home, arrow keys. Those are dead-end exploration — you can't see where focus is, and the next peek won't tell you anything new. The ONLY valid uses of press_key are: Escape (dismiss a modal you can't otherwise close) or Enter (submit a focused input when no explicit submit button exists).
+- Disabled controls = the app is waiting on a required input. If the forward button (Continue, Next, Submit, Generate, Save) is marked [DISABLED] in peek, look at the visible inputs and visible text — there is almost always an unfilled required field (often marked *, "required", or hinted at in placeholder text). Fill it, then peek again, then click the now-enabled forward button. Do not try keyboard tricks to bypass the disabled state.
 - Modal overlays intercept clicks on the page underneath. If you see a modal/dialog, interact with controls INSIDE the modal (or press Escape to dismiss it) before trying to reach the page beneath.
 - When a success criterion is satisfied, verify it with assert_visible before calling complete.
 
-BUDGET: you have a finite number of turns. Don't peek excessively (twice in a row without acting is usually wasted). Don't pile on extra steps after success.`;
+EFFICIENCY
+- Don't peek twice in a row without acting. If your last tool was peek and you didn't learn something that changed your plan, just act.
+- Aim to make forward progress every 1-2 turns. If you've taken 5+ turns without visible progress (URL unchanged, no new content), step back: peek, identify the SINGLE most likely forward control, click it.
+- When you reach the goal state, verify with assert_visible then immediately call complete — don't pile on extra checks.`;
 }
 function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
     if (/^https?:\/\//i.test(pathOrUrl))
@@ -42957,6 +42961,19 @@ async function snapshotPage(page) {
 function formatSnapshot(s) {
     const lines = [];
     lines.push(`URL: ${s.url}`);
+    // Flag disabled forward-progress buttons LOUDLY at the top — these are
+    // almost always the agent's blocker and need to be acted on (by filling
+    // a required input), not worked around with keyboard tricks.
+    const forwardLabels = /^(continue|next|submit|generate|save|create|add|publish|confirm|done|finish|proceed)\b/i;
+    const disabledForwardButtons = s.buttons.filter((b) => !b.enabled && forwardLabels.test(b.label));
+    if (disabledForwardButtons.length) {
+        const emptyInputs = s.inputs.filter((i) => !i.value).map((i) => `"${i.label}"`);
+        lines.push("");
+        lines.push(`!! FORWARD BUTTON DISABLED: ${disabledForwardButtons.map((b) => `"${b.label}"`).join(", ")}`);
+        lines.push(`!! Empty inputs that probably need values: ${emptyInputs.slice(0, 6).join(", ") || "(none visible — scroll/expand may be needed)"}`);
+        lines.push(`!! Fill them, then peek again. Do NOT use press_key to bypass.`);
+        lines.push("");
+    }
     if (s.modal.open) {
         lines.push(`MODAL OPEN: buttons=[${s.modal.buttons.join(" | ") || "(none)"}] inputs=[${s.modal.inputs.join(" | ") || "(none)"}]`);
         lines.push("(Interact with the modal's controls or press Escape before reaching the page underneath.)");
@@ -42978,7 +42995,7 @@ function formatSnapshot(s) {
     if (s.inputs.length) {
         lines.push(`INPUTS (${s.inputs.length}):`);
         for (const i of s.inputs)
-            lines.push(`  - "${i.label}"${i.value ? ` (current: "${i.value}")` : ""}`);
+            lines.push(`  - "${i.label}"${i.value ? ` (current: "${i.value}")` : " (empty)"}`);
     }
     if (s.visibleText.length) {
         lines.push(`VISIBLE TEXT (first 30):`);
@@ -43189,7 +43206,7 @@ async function runAgentReplay(input) {
 }
 async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
-    const maxTurns = input.maxTurns ?? 40;
+    const maxTurns = input.maxTurns ?? 60;
     const trace = [];
     // Land on the entry page before the agent's first turn — saves one tool call.
     try {
