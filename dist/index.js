@@ -46481,33 +46481,54 @@ async function run() {
                 videoPath = external_node_path_default().join(reportDir, webms[0]);
         }
         if (videoPath && external_node_fs_default().existsSync(videoPath)) {
-            core.info(`Uploading video ${external_node_path_default().basename(videoPath)}…`);
+            // Speed up the .webm 2x before upload. The raw Playwright recording
+            // includes long LLM-thinking pauses (5-30s) where nothing happens on
+            // screen — reviewers shouldn't have to sit through those at real time.
+            // mpdecimate also strips truly-identical frames so the codec compresses
+            // better. Audio is silent so we drop it.
+            let uploadVideoPath = videoPath;
+            try {
+                const fast = "/tmp/mint-video-fast.webm";
+                core.info("Speeding up video 2x for upload…");
+                (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -i "${videoPath}" -vf "mpdecimate=hi=64*4:lo=64*2:frac=0.1,setpts=0.5*PTS" -an -c:v libvpx-vp9 -b:v 0 -crf 35 -row-mt 1 -deadline good "${fast}"`, { stdio: "pipe" });
+                if (external_node_fs_default().existsSync(fast) && external_node_fs_default().statSync(fast).size > 0) {
+                    uploadVideoPath = fast;
+                    core.info(`Sped-up video: ${(external_node_fs_default().statSync(fast).size / 1048576).toFixed(2)} MB (was ${(external_node_fs_default().statSync(videoPath).size / 1048576).toFixed(2)} MB).`);
+                }
+            }
+            catch (err) {
+                core.warning(`Video speed-up failed, uploading original: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            core.info(`Uploading video ${external_node_path_default().basename(uploadVideoPath)}…`);
             videoUrl = await uploadMedia({
                 runId: missionId,
                 filename: "video.webm",
-                data: external_node_fs_default().readFileSync(videoPath),
+                data: external_node_fs_default().readFileSync(uploadVideoPath),
                 contentType: "video/webm",
                 apiBase,
                 apiKey
             });
             core.info(`Video uploaded: ${videoUrl}`);
-            // Generate animated GIF preview. GitHub's image proxy (camo) refuses to
-            // render images over ~5 MB inline, so we encode tight and retry smaller
-            // if the first attempt overshoots. Long wizard journeys would otherwise
-            // produce 7–10 MB GIFs that show as broken in the sticky comment.
+            // Generate animated GIF preview. Two design constraints:
+            //   1. GitHub's image proxy (camo) refuses to render images over ~5 MB
+            //      inline, so we retry smaller if the first attempt overshoots.
+            //   2. The raw video has long static "thinking" stretches between
+            //      actions; we crush those with mpdecimate so each surviving
+            //      "scene" displays for ~1-2 seconds rather than 10-30.
             try {
                 const gifPath = "/tmp/mint-preview.gif";
-                const GH_LIMIT = 4_500_000; // headroom under camo's ~5 MB cap
-                // Each preset: fps, width, colors, duration cap. Step down on overflow.
+                const GH_LIMIT = 4_500_000;
+                // Each preset: fps, width, colors. mpdecimate runs first so the
+                // *remaining* content gets the requested fps treatment.
                 const presets = [
-                    { fps: 4, w: 720, colors: 128, dur: 120 },
-                    { fps: 3, w: 560, colors: 96, dur: 90 },
-                    { fps: 2, w: 480, colors: 64, dur: 60 }
+                    { fps: 6, w: 640, colors: 128 },
+                    { fps: 5, w: 560, colors: 96 },
+                    { fps: 4, w: 480, colors: 64 }
                 ];
                 let chosen = null;
                 for (const p of presets) {
-                    core.info(`Generating animated GIF preview (fps=${p.fps}, w=${p.w}, colors=${p.colors}, dur=${p.dur}s)…`);
-                    (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -ss 4 -t ${p.dur} -i "${videoPath}" -vf "fps=${p.fps},scale=${p.w}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=${p.colors}[p];[s1][p]paletteuse=dither=sierra2_4a" -loop 0 "${gifPath}"`, { stdio: "pipe" });
+                    core.info(`Generating GIF (fps=${p.fps}, w=${p.w}, colors=${p.colors}; mpdecimate static-strip)…`);
+                    (0,external_node_child_process_namespaceObject.execSync)(`ffmpeg -y -i "${videoPath}" -vf "mpdecimate=hi=64*6:lo=64*3:frac=0.2,setpts=N/${p.fps}/TB,fps=${p.fps},scale=${p.w}:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=${p.colors}[p];[s1][p]paletteuse=dither=sierra2_4a" -loop 0 "${gifPath}"`, { stdio: "pipe" });
                     if (!external_node_fs_default().existsSync(gifPath))
                         break;
                     const size = external_node_fs_default().statSync(gifPath).size;
@@ -46516,7 +46537,7 @@ async function run() {
                         break;
                     }
                     core.info(`GIF too large (${(size / 1048576).toFixed(2)} MB > ${(GH_LIMIT / 1048576).toFixed(1)} MB), retrying smaller.`);
-                    chosen = { size, preset: p }; // keep last attempt as fallback
+                    chosen = { size, preset: p };
                 }
                 if (external_node_fs_default().existsSync(gifPath)) {
                     core.info(`Uploading GIF preview (${chosen ? (chosen.size / 1048576).toFixed(2) : "?"} MB)…`);
