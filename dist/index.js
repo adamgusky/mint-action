@@ -43423,7 +43423,12 @@ async function runAgentReplayMission(options, runDir, steps, evidence, artifacts
             consoleErrors.push(m.text()); });
         page.on("response", (r) => { if (r.status() >= 400)
             networkErrors.push(`${r.status()} ${r.url()}`); });
-        await applyBypasses(page, options.config, []);
+        // Agent missions don't carry an explicit precondition list, but every test
+        // generated from a `@mint test ...` comment runs as the chosen persona —
+        // so they ALWAYS need the logged_in bypass (otherwise scoped bypasses for
+        // session/localStorage are skipped and the app redirects to /login on the
+        // first navigate).
+        await applyBypasses(page, options.config, ["logged_in"]);
         await loginIfConfigured(page, options.config, options.mission.persona);
         let result = await runAgentReplay({
             page,
@@ -43536,7 +43541,12 @@ async function runAgentMission(options, runDir, steps, evidence, artifacts, cons
             consoleErrors.push(m.text()); });
         page.on("response", (r) => { if (r.status() >= 400)
             networkErrors.push(`${r.status()} ${r.url()}`); });
-        await applyBypasses(page, options.config, []);
+        // Agent missions don't carry an explicit precondition list, but every test
+        // generated from a `@mint test ...` comment runs as the chosen persona —
+        // so they ALWAYS need the logged_in bypass (otherwise scoped bypasses for
+        // session/localStorage are skipped and the app redirects to /login on the
+        // first navigate).
+        await applyBypasses(page, options.config, ["logged_in"]);
         await loginIfConfigured(page, options.config, options.mission.persona);
         const agentResult = await runAgent({
             page,
