@@ -29,6 +29,14 @@ export interface CompleteInput {
     suggestedFix?: string;
     videoUrl?: string;
     previewUrl?: string;
+    /** Tool-by-tool trace from the agent loop. Persisted so future runs of the
+     *  same intent can replay it deterministically instead of re-exploring. */
+    agentTrace?: Array<{
+        tool: string;
+        input: Record<string, unknown>;
+        ok: boolean;
+        result: string;
+    }>;
 }
 export declare class MintApi {
     private base;
@@ -43,6 +51,14 @@ export declare class MintApi {
         ok: true;
     }>;
     postJudge(id: string, ask: unknown): Promise<unknown>;
+    postAgentTurn(id: string, body: unknown): Promise<{
+        stopReason: string;
+        content: Array<Record<string, unknown>>;
+        usage: {
+            inputTokens: number;
+            outputTokens: number;
+        };
+    }>;
     syncFlows(repoId: string, flows: unknown[]): Promise<{
         synced: number;
     }>;

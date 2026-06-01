@@ -41720,6 +41720,133 @@ function smartTruncate(value, max) {
     return `${head}\n\n/* … ${skipped.toLocaleString()} chars elided (middle of file) … */\n\n${tail}`;
 }
 
+;// CONCATENATED MODULE: ../engine/dist/generate-agent-brief.js
+
+
+/**
+ * Generate a high-level brief for the tool-using agent. The brief describes
+ * the GOAL and what success looks like — it does NOT pre-decide concrete
+ * steps. The agent decides moves at runtime by looking at the live page.
+ *
+ * Inputs the LLM reads (so the brief is actually informed):
+ *   - The developer's plain-English testIntent.
+ *   - Full contents of relevant UI files (so success criteria reference
+ *     real on-screen text the agent will see).
+ *   - The product map (routes + features) so we can pick a sensible entry.
+ *   - The mint.yml personas so we can pick whose login to use.
+ *
+ * Output: { goal, entryUrl, successCriteria[], hints[], persona }.
+ */
+const generate_agent_brief_SYSTEM = (/* unused pure expression or super */ null && (`You are a test planner for Mint, a tool-using browser agent.
+
+A developer asked you in plain English to test a specific user flow. You DO NOT write step-by-step actions — a separate in-browser agent will figure out concrete clicks/fills at runtime by looking at the live page. Your job is to give that agent a tight, well-grounded brief.
+
+The brief has four pieces:
+
+1. **goal**: One paragraph describing the user-facing outcome the agent is verifying. Written for the agent, not the developer. Example: "Reach the outline step of the article builder from the entry page — fill any required fields and click through the multi-step wizard until the Outline UI is visibly rendered."
+
+2. **entryUrl**: The single URL the agent should land on first. Pick the most direct route from the product map. Do NOT pick deep sub-pages the user is supposed to navigate into — the agent will navigate the rest using on-page nav (tabs, sidebar links, buttons). Example: "/articlebuilder" not "/articlebuilder/outline-step".
+
+3. **successCriteria** (array of 1-4 short strings): Concrete, observable conditions that must ALL be true for the test to be a "pass". These are what the agent will assert via assert_visible at the end. Pull text or controls that you have ACTUALLY SEEN in the source files. Examples: "The text 'Review Outline' is visible on the page.", "An image preview appears in the Test Image Generation panel."
+
+4. **hints** (array of 0-5 short strings, optional): Non-prescriptive nuggets from your code reading that help the agent. Use these for non-obvious facts about the UI — never use them to write step-by-step instructions. Good hint: "The image playground lives inside the Image tab of Settings — it's not at /settings/images." Bad hint: "Click the Image tab, then expand the panel, then fill the prompt."
+
+5. **persona**: Pick the mint.yml persona id whose plan/data unlocks this flow.
+
+Rules:
+- Be specific about the GOAL. "Test article builder" is too vague. "Reach the outline step starting from /articlebuilder" is right.
+- successCriteria must reference text/controls you saw in the source. Don't invent.
+- DO NOT write step-by-step instructions anywhere. No "first click X then click Y". The agent owns that.
+- DO NOT guess at sub-page URLs. If the destination is inside a nav-tab or sub-section, pick the parent URL and let the agent navigate.
+- If the intent cannot be exercised through a browser (backend-only change, infrastructure work), return { "brief": null, "reason": "..." }.`));
+const BRIEF_JSON_SHAPE = (/* unused pure expression or super */ null && (`{
+  "brief": {
+    "goal": "one paragraph describing the user-facing outcome",
+    "entryUrl": "/path",
+    "successCriteria": ["text or control that must be visible at success", "..."],
+    "hints": ["optional non-prescriptive UI fact", "..."],
+    "persona": "<persona id from mint.yml>"
+  },
+  "reason": "1-2 sentences on why this brief tests the developer's request"
+}`));
+const briefSchema = objectType({
+    goal: stringType().min(8),
+    entryUrl: stringType().min(1),
+    successCriteria: arrayType(stringType().min(2)).min(1).max(8),
+    hints: arrayType(stringType()).default([]),
+    persona: stringType().min(1)
+});
+const generate_agent_brief_responseSchema = objectType({
+    brief: briefSchema.nullable(),
+    reason: stringType().default("")
+});
+async function generateAgentBriefFromIntent(input) {
+    const prompt = generate_agent_brief_buildPrompt(input);
+    const llmResult = await input.llm({
+        system: generate_agent_brief_SYSTEM,
+        prompt,
+        jsonOnly: true,
+        maxTokens: 4_000
+    });
+    const parsed = generate_agent_brief_responseSchema.parse(parseLlmJson(llmResult.text));
+    return {
+        brief: parsed.brief,
+        reason: parsed.reason,
+        inputTokens: llmResult.inputTokens,
+        outputTokens: llmResult.outputTokens
+    };
+}
+function generate_agent_brief_buildPrompt(input) {
+    const personas = Object.entries(input.config.auth.personas)
+        .map(([id, p]) => `  - ${id}: plan=${p.plan ?? "none"}, role=${p.role ?? "none"}, seeded_data=${(p.data ?? []).join(",") || "none"}`)
+        .join("\n") || "  (no personas)";
+    const routes = (input.productMap?.routes ?? [])
+        .slice(0, 40)
+        .map((r) => `  - ${r.path} (${r.name})`)
+        .join("\n") || "  (no routes)";
+    const fileBlocks = Object.entries(input.sourceCorpus)
+        .map(([file, content]) => `\n--- FILE: ${file} ---\n${generate_agent_brief_smartTruncate(content, 80_000)}`)
+        .join("\n");
+    const diffBlock = input.diffText ? `\n\nPR DIFF (additional context):\n${generate_agent_brief_truncate(input.diffText, 10_000)}` : "";
+    const personaHint = input.persona ? `\n\nDeveloper requested persona: ${input.persona}` : "";
+    const routesHint = input.relatedRoutes?.length ? `\n\nParser-suggested routes: ${input.relatedRoutes.join(", ")}` : "";
+    return `Developer's testIntent:
+"""
+${input.testIntent}
+"""
+
+App: ${input.config.app.name}
+
+Personas:
+${personas}
+
+Routes:
+${routes}
+${personaHint}${routesHint}
+
+SOURCE FILES (read these so successCriteria references real on-screen text):
+${fileBlocks}
+${diffBlock}
+
+Design a brief for the in-browser agent. Return JSON matching:
+${BRIEF_JSON_SHAPE}
+
+Reminder: NO step-by-step instructions. The agent decides moves at runtime. Your job is goal + entry + success criteria + (optional) non-obvious hints.`;
+}
+function generate_agent_brief_truncate(value, max) {
+    return value.length <= max ? value : `${value.slice(0, max)}\n... (truncated)`;
+}
+function generate_agent_brief_smartTruncate(value, max) {
+    if (value.length <= max)
+        return value;
+    const headSize = Math.floor(max * 0.4);
+    const tailSize = max - headSize - 200;
+    const head = value.slice(0, headSize);
+    const tail = value.slice(value.length - tailSize);
+    const skipped = value.length - headSize - tailSize;
+    return `${head}\n\n/* … ${skipped.toLocaleString()} chars elided (middle of file) … */\n\n${tail}`;
+}
+
 ;// CONCATENATED MODULE: ../engine/dist/validation.js
 
 
@@ -41988,6 +42115,7 @@ function historyPath(paths, flowId) {
 }
 
 ;// CONCATENATED MODULE: ../engine/dist/index.js
+
 
 
 
@@ -42613,6 +42741,603 @@ function titleCase(value) {
         .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+;// CONCATENATED MODULE: ../browser/dist/agent-loop.js
+
+
+const AGENT_TOOLS = [
+    {
+        name: "navigate",
+        description: "Navigate the browser to a path (relative to the app base URL) or a full URL. Use this to jump directly to a known route.",
+        input_schema: {
+            type: "object",
+            properties: {
+                path: { type: "string", description: "Path like '/settings' or '/settings/images', or full URL." }
+            },
+            required: ["path"]
+        }
+    },
+    {
+        name: "peek",
+        description: "Snapshot the current page. Returns visible buttons, links, inputs, nav landmarks (tabs/sidebar/breadcrumbs), URL, and a sample of visible text. Use this OFTEN — every time you need to decide what to do next, look first.",
+        input_schema: {
+            type: "object",
+            properties: {
+                reason: { type: "string", description: "One-line note about why you're looking — appears in the step trace." }
+            },
+            required: ["reason"]
+        }
+    },
+    {
+        name: "click",
+        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, the page state usually changes — peek again before deciding the next move.",
+        input_schema: {
+            type: "object",
+            properties: {
+                label: { type: "string", description: "Visible text of the control to click." },
+                kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any')." }
+            },
+            required: ["label"]
+        }
+    },
+    {
+        name: "fill",
+        description: "Type a value into an input matched by its label or placeholder.",
+        input_schema: {
+            type: "object",
+            properties: {
+                field: { type: "string", description: "Visible label or placeholder of the input." },
+                value: { type: "string", description: "Value to type." }
+            },
+            required: ["field", "value"]
+        }
+    },
+    {
+        name: "press_key",
+        description: "Press a keyboard key (Escape, Enter, Tab, etc.). Useful for dismissing modals.",
+        input_schema: {
+            type: "object",
+            properties: { key: { type: "string" } },
+            required: ["key"]
+        }
+    },
+    {
+        name: "assert_visible",
+        description: "Verify a piece of text is visible on the page. Polls for up to 20s by default. Use to confirm a success state has actually arrived.",
+        input_schema: {
+            type: "object",
+            properties: {
+                text: { type: "string" },
+                timeoutMs: { type: "number", description: "Defaults to 20000." }
+            },
+            required: ["text"]
+        }
+    },
+    {
+        name: "complete",
+        description: "Signal the test is over. Use 'passed' only if every success criterion is verifiably satisfied. Use 'failed' if you're confident the feature is broken (cite the evidence). Use 'blocked' if you couldn't proceed (e.g., env issue, auth wall, missing fixture).",
+        input_schema: {
+            type: "object",
+            properties: {
+                status: { type: "string", enum: ["passed", "failed", "blocked"] },
+                summary: { type: "string", description: "One paragraph: what you did, what you saw, what makes you confident in the verdict." }
+            },
+            required: ["status", "summary"]
+        }
+    }
+];
+function systemPromptFor(input) {
+    return `You are Mint, an in-browser test agent. You drive a real Playwright-controlled browser through user flows in the application under test.
+
+GOAL: ${input.goal}
+
+ENTRY: ${input.entryUrl}
+
+SUCCESS CRITERIA (every one must be verifiably satisfied before you call complete with status="passed"):
+${input.successCriteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}
+
+${input.hints?.length ? `HINTS FROM CODE READING:\n${input.hints.map((h) => `  - ${h}`).join("\n")}\n` : ""}
+
+OPERATING PRINCIPLES
+- You are stateless across turns: each turn you only see the tool results so far. Always peek the page before deciding what to do next when you're unsure of the current state.
+- Multi-step UIs are normal. Wizards, modals, expand/collapse panels, tabs inside settings pages, async backend work that takes 5-30s to finish — assume all of these. After clicking a control that triggers work, peek again to see what changed before doing the next thing.
+- Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section (e.g. "image settings" inside /settings), peek and click the visible nav/tab. Tabs and sidebar items are normal UI — they show up as buttons/links in peek output.
+- Disabled controls = the app is waiting on something. If a primary button is disabled, find the required input(s) above and fill them first.
+- Modal overlays intercept clicks on the page underneath. If you see a modal/dialog, interact with controls INSIDE the modal (or press Escape to dismiss it) before trying to reach the page beneath.
+- When a success criterion is satisfied, verify it with assert_visible before calling complete.
+
+BUDGET: you have a finite number of turns. Don't peek excessively (twice in a row without acting is usually wasted). Don't pile on extra steps after success.`;
+}
+function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
+    if (/^https?:\/\//i.test(pathOrUrl))
+        return pathOrUrl;
+    const base = baseUrl.replace(/\/$/, "");
+    const tail = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
+    return base + tail;
+}
+async function snapshotPage(page) {
+    return await page.evaluate(() => {
+        const seen = new WeakSet();
+        const visible = (el) => {
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 2 || rect.height < 2)
+                return false;
+            const style = window.getComputedStyle(el);
+            if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")
+                return false;
+            return true;
+        };
+        const textOf = (el) => {
+            const aria = el.getAttribute("aria-label");
+            if (aria)
+                return aria.trim();
+            const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+            return t.slice(0, 120);
+        };
+        const buttons = [];
+        const links = [];
+        const inputs = [];
+        const tabs = [];
+        const nav = [];
+        const visibleText = [];
+        let modalEl = null;
+        document.querySelectorAll('[role="dialog"], [aria-modal="true"], div[class*="fixed"][class*="inset-0"]').forEach((d) => {
+            if (visible(d) && !modalEl)
+                modalEl = d;
+        });
+        const modalButtons = [];
+        const modalInputs = [];
+        if (modalEl) {
+            modalEl.querySelectorAll("button").forEach((b) => {
+                if (visible(b))
+                    modalButtons.push(textOf(b));
+            });
+            modalEl.querySelectorAll("input, textarea").forEach((i) => {
+                if (visible(i))
+                    modalInputs.push(textOf(i) || i.placeholder || "(input)");
+            });
+        }
+        document.querySelectorAll('[role="tab"]').forEach((el) => {
+            if (!visible(el))
+                return;
+            seen.add(el);
+            tabs.push({ label: textOf(el), selected: el.getAttribute("aria-selected") === "true" });
+        });
+        document.querySelectorAll("nav a, [role='navigation'] a, aside a").forEach((el) => {
+            if (!visible(el))
+                return;
+            const t = textOf(el);
+            if (t)
+                nav.push(t);
+        });
+        document.querySelectorAll("button").forEach((el) => {
+            if (!visible(el) || seen.has(el))
+                return;
+            const label = textOf(el);
+            if (!label)
+                return;
+            buttons.push({ label, enabled: !el.disabled });
+        });
+        document.querySelectorAll("a[href]").forEach((el) => {
+            if (!visible(el) || seen.has(el))
+                return;
+            const label = textOf(el);
+            if (label)
+                links.push({ label });
+        });
+        document.querySelectorAll("input, textarea, select").forEach((el) => {
+            if (!visible(el))
+                return;
+            const input = el;
+            const label = input.getAttribute("aria-label") ||
+                input.getAttribute("placeholder") ||
+                (input.labels && input.labels[0]?.textContent) ||
+                input.name ||
+                "(input)";
+            inputs.push({ label: label.toString().trim().slice(0, 80), value: (input.value || "").slice(0, 80) });
+        });
+        document.querySelectorAll("h1, h2, h3, h4, [role='heading'], p, li, label, span").forEach((el) => {
+            if (!visible(el))
+                return;
+            const t = (el.textContent || "").replace(/\s+/g, " ").trim();
+            if (t.length > 1 && t.length < 200)
+                visibleText.push(t);
+        });
+        return {
+            url: location.href,
+            buttons: buttons.slice(0, 40),
+            links: links.slice(0, 25),
+            inputs: inputs.slice(0, 25),
+            tabs,
+            nav: Array.from(new Set(nav)).slice(0, 20),
+            visibleText: Array.from(new Set(visibleText)).slice(0, 40),
+            modal: { open: !!modalEl, buttons: modalButtons.slice(0, 12), inputs: modalInputs.slice(0, 8) }
+        };
+    });
+}
+function formatSnapshot(s) {
+    const lines = [];
+    lines.push(`URL: ${s.url}`);
+    if (s.modal.open) {
+        lines.push(`MODAL OPEN: buttons=[${s.modal.buttons.join(" | ") || "(none)"}] inputs=[${s.modal.inputs.join(" | ") || "(none)"}]`);
+        lines.push("(Interact with the modal's controls or press Escape before reaching the page underneath.)");
+    }
+    if (s.tabs.length) {
+        lines.push(`TABS: ${s.tabs.map((t) => `${t.label}${t.selected ? "*" : ""}`).join(" | ")}`);
+    }
+    if (s.nav.length) {
+        lines.push(`NAV: ${s.nav.join(" | ")}`);
+    }
+    lines.push(`BUTTONS (${s.buttons.length}):`);
+    for (const b of s.buttons)
+        lines.push(`  - "${b.label}"${b.enabled ? "" : " [DISABLED]"}`);
+    if (s.links.length) {
+        lines.push(`LINKS (${s.links.length}):`);
+        for (const l of s.links)
+            lines.push(`  - "${l.label}"`);
+    }
+    if (s.inputs.length) {
+        lines.push(`INPUTS (${s.inputs.length}):`);
+        for (const i of s.inputs)
+            lines.push(`  - "${i.label}"${i.value ? ` (current: "${i.value}")` : ""}`);
+    }
+    if (s.visibleText.length) {
+        lines.push(`VISIBLE TEXT (first 30):`);
+        for (const t of s.visibleText.slice(0, 30))
+            lines.push(`  - ${t}`);
+    }
+    return lines.join("\n");
+}
+function pickElementHandle(page, label, kind) {
+    const safe = label.replace(/"/g, '\\"');
+    const selectors = [];
+    if (kind === "tab" || kind === "any")
+        selectors.push(`[role="tab"]:has-text("${safe}")`);
+    if (kind === "button" || kind === "any")
+        selectors.push(`button:has-text("${safe}")`, `[role="button"]:has-text("${safe}")`);
+    if (kind === "link" || kind === "any")
+        selectors.push(`a:has-text("${safe}")`, `[role="link"]:has-text("${safe}")`);
+    if (kind === "any")
+        selectors.push(`[aria-label*="${safe}" i]`);
+    return selectors.map((s) => page.locator(s));
+}
+async function clickByLabel(page, label, kind) {
+    const locators = pickElementHandle(page, label, kind);
+    for (const loc of locators) {
+        const count = await loc.count().catch(() => 0);
+        for (let i = 0; i < Math.min(count, 5); i++) {
+            const el = loc.nth(i);
+            const visible = await el.isVisible({ timeout: 500 }).catch(() => false);
+            if (!visible)
+                continue;
+            const enabled = await el.isEnabled({ timeout: 500 }).catch(() => true);
+            if (!enabled)
+                continue;
+            try {
+                await el.click({ timeout: 4000 });
+                return { ok: true, detail: `Clicked "${label}".` };
+            }
+            catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                if (/intercepts pointer events/i.test(msg)) {
+                    await page.keyboard.press("Escape").catch(() => undefined);
+                    await page.waitForTimeout(300);
+                    try {
+                        await el.click({ timeout: 3000 });
+                        return { ok: true, detail: `Clicked "${label}" after pressing Escape to clear an overlay.` };
+                    }
+                    catch {
+                        return { ok: false, detail: `Click "${label}" was intercepted by a modal overlay. Try interacting with the modal's controls first, or press_key("Escape").` };
+                    }
+                }
+                return { ok: false, detail: `Click "${label}" failed: ${msg.slice(0, 200)}` };
+            }
+        }
+    }
+    return { ok: false, detail: `No clickable ${kind} found matching "${label}". Peek the page to see what's actually visible.` };
+}
+async function fillByLabel(page, field, value) {
+    const safe = field.replace(/"/g, '\\"');
+    const selectors = [
+        `input[aria-label*="${safe}" i]`,
+        `textarea[aria-label*="${safe}" i]`,
+        `input[placeholder*="${safe}" i]`,
+        `textarea[placeholder*="${safe}" i]`,
+        `input[name*="${safe}" i]`,
+        `textarea[name*="${safe}" i]`
+    ];
+    for (const sel of selectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.count().catch(() => 0)) {
+            try {
+                await loc.fill(value, { timeout: 3000 });
+                return { ok: true, detail: `Filled "${field}" with "${value.slice(0, 40)}${value.length > 40 ? "…" : ""}".` };
+            }
+            catch (err) {
+                return { ok: false, detail: `Fill "${field}" failed: ${err instanceof Error ? err.message.slice(0, 200) : ""}` };
+            }
+        }
+    }
+    // Label-association fallback
+    const labelLoc = page.locator(`label:has-text("${safe}")`).first();
+    if (await labelLoc.count().catch(() => 0)) {
+        const forId = await labelLoc.getAttribute("for").catch(() => null);
+        if (forId) {
+            const input = page.locator(`#${forId}`).first();
+            if (await input.count().catch(() => 0)) {
+                try {
+                    await input.fill(value, { timeout: 3000 });
+                    return { ok: true, detail: `Filled "${field}" via label for→id.` };
+                }
+                catch (err) {
+                    return { ok: false, detail: `Fill via label failed: ${err instanceof Error ? err.message.slice(0, 200) : ""}` };
+                }
+            }
+        }
+    }
+    return { ok: false, detail: `No input found matching "${field}". Peek to see available inputs.` };
+}
+async function captureScreenshot(page, runDir, index) {
+    const dir = external_node_path_namespaceObject.join(runDir, "step-screenshots");
+    await (0,external_node_fs_promises_namespaceObject.mkdir)(dir, { recursive: true });
+    await page.screenshot({ path: external_node_path_namespaceObject.join(dir, `step-${String(index).padStart(2, "0")}.png`), fullPage: false }).catch(() => undefined);
+}
+/** Deterministic replay of a previously-recorded agent trace. No LLM calls.
+ *  Re-executes each tool in order, then verifies every success criterion. If
+ *  any tool fails OR a criterion isn't satisfied, returns blocked so the
+ *  caller can decide whether to fall back to fresh exploration. */
+async function runAgentReplay(input) {
+    const { page, baseUrl, runDir, trace, steps } = input;
+    const liveTrace = [];
+    let toolCalls = 0;
+    // Always land on the entry URL first — matches how runAgent starts.
+    try {
+        await page.goto(agent_loop_absoluteUrl(baseUrl, input.entryUrl), { waitUntil: "domcontentloaded", timeout: 30_000 });
+    }
+    catch {
+        /* non-fatal */
+    }
+    // Skip recorded `peek` calls — they're observation noise. Skip `complete`
+    // too; we'll declare the verdict after re-verifying criteria.
+    const executable = trace.filter((t) => t.tool !== "peek" && t.tool !== "complete");
+    for (const entry of executable) {
+        toolCalls++;
+        const inp = entry.input ?? {};
+        let resultText = "";
+        let ok = true;
+        try {
+            if (entry.tool === "navigate") {
+                const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
+                await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
+                resultText = `Navigated to ${target}.`;
+                steps.push(resultText);
+            }
+            else if (entry.tool === "click") {
+                const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any");
+                ok = out.ok;
+                resultText = out.detail;
+                if (ok)
+                    steps.push(resultText);
+            }
+            else if (entry.tool === "fill") {
+                const out = await fillByLabel(page, String(inp.field ?? ""), String(inp.value ?? ""));
+                ok = out.ok;
+                resultText = out.detail;
+                if (ok)
+                    steps.push(resultText);
+            }
+            else if (entry.tool === "press_key") {
+                const key = String(inp.key ?? "Escape");
+                await page.keyboard.press(key);
+                resultText = `Pressed ${key}.`;
+                steps.push(resultText);
+            }
+            else if (entry.tool === "assert_visible") {
+                const text = String(inp.text ?? "");
+                const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout: 20_000 }).catch(() => false);
+                ok = found;
+                resultText = found ? `Asserted "${text}" visible.` : `"${text}" did not appear.`;
+                steps.push(resultText);
+            }
+            else {
+                resultText = `Skipped unknown tool "${entry.tool}".`;
+                steps.push(resultText);
+            }
+            if (ok) {
+                await page.waitForTimeout(300);
+                await captureScreenshot(page, runDir, steps.length);
+            }
+        }
+        catch (err) {
+            ok = false;
+            resultText = `Replay tool ${entry.tool} threw: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        liveTrace.push({ tool: entry.tool, input: inp, ok, result: resultText });
+        if (!ok) {
+            return {
+                status: "blocked",
+                summary: `Replay drifted: ${entry.tool}(${JSON.stringify(inp).slice(0, 100)}) failed. The UI likely changed since the recording.`,
+                toolCalls,
+                turns: 1,
+                trace: liveTrace
+            };
+        }
+    }
+    // Verify all success criteria after replay completes.
+    const failed = [];
+    for (const crit of input.successCriteria) {
+        const visible = await page.getByText(crit, { exact: false }).first().isVisible({ timeout: 8_000 }).catch(() => false);
+        if (!visible)
+            failed.push(crit);
+    }
+    await captureScreenshot(page, runDir, steps.length + 1);
+    if (failed.length > 0) {
+        return {
+            status: "blocked",
+            summary: `Replay finished but ${failed.length} success criterion/criteria not visible: ${failed.join(" | ")}.`,
+            toolCalls,
+            turns: 1,
+            trace: liveTrace
+        };
+    }
+    return {
+        status: "passed",
+        summary: `Replayed ${toolCalls} tool calls from saved recording; all ${input.successCriteria.length} success criteria verified.`,
+        toolCalls,
+        turns: 0,
+        trace: liveTrace
+    };
+}
+async function runAgent(input) {
+    const { page, baseUrl, runDir, agent, steps } = input;
+    const maxTurns = input.maxTurns ?? 40;
+    const trace = [];
+    // Land on the entry page before the agent's first turn — saves one tool call.
+    try {
+        await page.goto(agent_loop_absoluteUrl(baseUrl, input.entryUrl), { waitUntil: "domcontentloaded", timeout: 30_000 });
+    }
+    catch {
+        /* non-fatal — agent can navigate via tool */
+    }
+    const system = systemPromptFor(input);
+    const messages = [{
+            role: "user",
+            content: `You are now in the browser at the entry page. Peek to see what's there, then proceed toward the goal. Call complete when every success criterion is verifiably satisfied (or when you're confident you can't proceed).`
+        }];
+    let turns = 0;
+    let toolCalls = 0;
+    let verdict = null;
+    while (turns < maxTurns && !verdict) {
+        turns++;
+        let response;
+        try {
+            response = await agent({ system, messages, tools: AGENT_TOOLS, maxTokens: 2048 });
+        }
+        catch (err) {
+            return {
+                status: "blocked",
+                summary: `Agent turn ${turns} failed: ${err instanceof Error ? err.message : String(err)}`,
+                toolCalls,
+                turns,
+                trace
+            };
+        }
+        // Record the assistant message verbatim — required for the next turn.
+        messages.push({ role: "assistant", content: response.content });
+        const toolResults = [];
+        for (const block of response.content) {
+            const b = block;
+            if (b.type === "text" && b.text) {
+                // Agent reasoning. Not surfaced as a step on its own; the next tool call will be.
+            }
+            else if (b.type === "tool_use" && b.name && b.id) {
+                toolCalls++;
+                const name = b.name;
+                const inp = b.input ?? {};
+                let resultText = "";
+                let ok = true;
+                try {
+                    if (name === "navigate") {
+                        const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
+                        await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
+                        resultText = `Navigated to ${target}.`;
+                        steps.push(`Navigated to ${target}.`);
+                        await captureScreenshot(page, runDir, steps.length);
+                        await input.onScreenshot?.(steps.length);
+                    }
+                    else if (name === "peek") {
+                        const snap = await snapshotPage(page);
+                        resultText = formatSnapshot(snap);
+                    }
+                    else if (name === "click") {
+                        const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any");
+                        ok = out.ok;
+                        resultText = out.detail;
+                        if (out.ok) {
+                            steps.push(out.detail);
+                            await page.waitForTimeout(400);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                        }
+                    }
+                    else if (name === "fill") {
+                        const out = await fillByLabel(page, String(inp.field ?? ""), String(inp.value ?? ""));
+                        ok = out.ok;
+                        resultText = out.detail;
+                        if (out.ok) {
+                            steps.push(out.detail);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                        }
+                    }
+                    else if (name === "press_key") {
+                        const key = String(inp.key ?? "Escape");
+                        await page.keyboard.press(key);
+                        await page.waitForTimeout(300);
+                        resultText = `Pressed ${key}.`;
+                        steps.push(`Pressed ${key}.`);
+                        await captureScreenshot(page, runDir, steps.length);
+                        await input.onScreenshot?.(steps.length);
+                    }
+                    else if (name === "assert_visible") {
+                        const text = String(inp.text ?? "");
+                        const timeout = Number(inp.timeoutMs ?? 20_000);
+                        const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout }).catch(() => false);
+                        ok = found;
+                        resultText = found ? `Text "${text}" is visible.` : `Text "${text}" did NOT appear within ${timeout}ms.`;
+                        steps.push(found ? `Asserted "${text}" is visible.` : `Could not verify "${text}".`);
+                        await captureScreenshot(page, runDir, steps.length);
+                        await input.onScreenshot?.(steps.length);
+                    }
+                    else if (name === "complete") {
+                        const status = inp.status ?? "blocked";
+                        const summary = String(inp.summary ?? "");
+                        verdict = { status, summary, toolCalls, turns, trace };
+                        resultText = `Run marked ${status}.`;
+                    }
+                    else {
+                        ok = false;
+                        resultText = `Unknown tool "${name}".`;
+                    }
+                }
+                catch (err) {
+                    ok = false;
+                    resultText = `Tool ${name} threw: ${err instanceof Error ? err.message : String(err)}`;
+                }
+                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 400) });
+                toolResults.push({
+                    type: "tool_result",
+                    tool_use_id: b.id,
+                    content: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText,
+                    is_error: !ok
+                });
+            }
+        }
+        if (verdict)
+            break;
+        if (response.stopReason === "end_turn" && toolResults.length === 0) {
+            // Agent stopped without calling complete — treat as blocked.
+            verdict = {
+                status: "blocked",
+                summary: "Agent ended the turn without calling complete. Likely confused; check the trace.",
+                toolCalls,
+                turns,
+                trace
+            };
+            break;
+        }
+        if (toolResults.length > 0) {
+            messages.push({ role: "user", content: toolResults });
+        }
+    }
+    return verdict ?? {
+        status: "blocked",
+        summary: `Hit max turns (${maxTurns}) without complete. Last tools: ${trace.slice(-3).map((t) => t.tool).join(", ")}`,
+        toolCalls,
+        turns,
+        trace
+    };
+}
+
 ;// CONCATENATED MODULE: ../browser/dist/index.js
 
 
@@ -42621,6 +43346,214 @@ function titleCase(value) {
 
 
 
+
+
+/**
+ * Agent-replay execution path: re-execute a previously-recorded tool trace.
+ * If replay drifts (UI changed), fall back to fresh agent exploration when
+ * an agent caller is available — otherwise return blocked with the drift
+ * evidence so the dev knows the recording is stale.
+ */
+async function runAgentReplayMission(options, runDir, steps, evidence, artifacts, consoleErrors, networkErrors, replay) {
+    let browser;
+    let context;
+    try {
+        browser = await external_playwright_namespaceObject.chromium.launch({ headless: !options.headed });
+        const videoSize = { width: options.config.artifacts.video.width, height: options.config.artifacts.video.height };
+        context = await browser.newContext({
+            recordVideo: { dir: runDir, size: videoSize },
+            viewport: videoSize,
+            deviceScaleFactor: 1
+        });
+        const page = await context.newPage();
+        page.on("console", (m) => { if (m.type() === "error")
+            consoleErrors.push(m.text()); });
+        page.on("response", (r) => { if (r.status() >= 400)
+            networkErrors.push(`${r.status()} ${r.url()}`); });
+        await applyBypasses(page, options.config, []);
+        await loginIfConfigured(page, options.config, options.mission.persona);
+        let result = await runAgentReplay({
+            page,
+            baseUrl: options.config.app.base_url,
+            runDir,
+            successCriteria: replay.brief.successCriteria,
+            trace: replay.trace,
+            steps,
+            entryUrl: replay.brief.entryUrl
+        });
+        // Drift: replay failed and we have an agent caller — re-explore fresh.
+        let fellBack = false;
+        if (result.status !== "passed" && options.agent) {
+            evidence.push(`Replay drifted (${result.summary}). Falling back to fresh agent exploration.`);
+            fellBack = true;
+            // Wipe steps/screenshots from the failed replay so the fresh run starts clean.
+            steps.length = 0;
+            result = await runAgent({
+                page,
+                baseUrl: options.config.app.base_url,
+                runDir,
+                goal: replay.brief.goal,
+                entryUrl: replay.brief.entryUrl,
+                successCriteria: replay.brief.successCriteria,
+                hints: [
+                    ...(replay.brief.hints ?? []),
+                    `A previous recording for this intent existed but drifted; the steps that worked last time were: ${replay.trace.filter((t) => t.tool !== "peek" && t.tool !== "complete").map((t) => `${t.tool}(${JSON.stringify(t.input).slice(0, 80)})`).join(" → ")}`
+                ],
+                agent: options.agent,
+                steps
+            });
+        }
+        await pauseForVideo(page, options.config, "final");
+        await context.close();
+        context = undefined;
+        const video = page.video();
+        if (video) {
+            try {
+                artifacts.video = await video.path();
+            }
+            catch { /* best-effort */ }
+        }
+        artifacts.reportDir = runDir;
+        evidence.push(fellBack
+            ? `Agent re-exploration verdict: ${result.status}. ${result.summary}`
+            : `Replay verdict: ${result.status}. ${result.summary} (origin run: ${replay.sourceRunId ?? "unknown"})`);
+        for (const error of consoleErrors)
+            evidence.push(`Console error: ${error}`);
+        for (const error of networkErrors)
+            evidence.push(`Network error: ${error}`);
+        const testResult = {
+            status: result.status,
+            goal: options.mission.changedFeature,
+            persona: options.mission.persona,
+            setupStatus: options.setupStatus,
+            steps,
+            evidence,
+            artifacts,
+            consoleErrors,
+            networkErrors
+        };
+        await writeReport(runDir, testResult);
+        await dist_writeJson(external_node_path_namespaceObject.join(runDir, "agent-trace.json"), result.trace);
+        return testResult;
+    }
+    catch (err) {
+        try {
+            await context?.close();
+        }
+        catch { /* noop */ }
+        const testResult = {
+            status: "blocked",
+            goal: options.mission.changedFeature,
+            persona: options.mission.persona,
+            setupStatus: options.setupStatus,
+            steps,
+            evidence: evidence.concat([`Replay mission threw: ${err instanceof Error ? err.message : String(err)}`]),
+            artifacts,
+            consoleErrors,
+            networkErrors
+        };
+        await writeReport(runDir, testResult);
+        return testResult;
+    }
+    finally {
+        try {
+            await browser?.close();
+        }
+        catch { /* noop */ }
+    }
+}
+/**
+ * Agent-brief execution path: spin up a browser, hand the page to the
+ * tool-using agent loop, package its verdict into a TestResult. No
+ * pre-planned flow file required.
+ */
+async function runAgentMission(options, runDir, steps, evidence, artifacts, consoleErrors, networkErrors, brief) {
+    let browser;
+    let context;
+    try {
+        browser = await external_playwright_namespaceObject.chromium.launch({ headless: !options.headed });
+        const videoSize = { width: options.config.artifacts.video.width, height: options.config.artifacts.video.height };
+        context = await browser.newContext({
+            recordVideo: { dir: runDir, size: videoSize },
+            viewport: videoSize,
+            deviceScaleFactor: 1
+        });
+        const page = await context.newPage();
+        page.on("console", (m) => { if (m.type() === "error")
+            consoleErrors.push(m.text()); });
+        page.on("response", (r) => { if (r.status() >= 400)
+            networkErrors.push(`${r.status()} ${r.url()}`); });
+        await applyBypasses(page, options.config, []);
+        await loginIfConfigured(page, options.config, options.mission.persona);
+        const agentResult = await runAgent({
+            page,
+            baseUrl: options.config.app.base_url,
+            runDir,
+            goal: brief.goal,
+            entryUrl: brief.entryUrl,
+            successCriteria: brief.successCriteria,
+            hints: brief.hints,
+            agent: options.agent,
+            steps
+        });
+        await pauseForVideo(page, options.config, "final");
+        await context.close();
+        context = undefined;
+        const video = page.video();
+        if (video) {
+            try {
+                artifacts.video = await video.path();
+            }
+            catch { /* best-effort */ }
+        }
+        artifacts.reportDir = runDir;
+        evidence.push(`Agent verdict: ${agentResult.status}. ${agentResult.summary}`);
+        evidence.push(`Agent stats: ${agentResult.turns} turns, ${agentResult.toolCalls} tool calls.`);
+        for (const error of consoleErrors)
+            evidence.push(`Console error: ${error}`);
+        for (const error of networkErrors)
+            evidence.push(`Network error: ${error}`);
+        const result = {
+            status: agentResult.status,
+            goal: options.mission.changedFeature,
+            persona: options.mission.persona,
+            setupStatus: options.setupStatus,
+            steps,
+            evidence,
+            artifacts,
+            consoleErrors,
+            networkErrors
+        };
+        await writeReport(runDir, result);
+        await dist_writeJson(external_node_path_namespaceObject.join(runDir, "agent-trace.json"), agentResult.trace);
+        return result;
+    }
+    catch (err) {
+        try {
+            await context?.close();
+        }
+        catch { /* noop */ }
+        const result = {
+            status: "blocked",
+            goal: options.mission.changedFeature,
+            persona: options.mission.persona,
+            setupStatus: options.setupStatus,
+            steps,
+            evidence: evidence.concat([`Agent run threw: ${err instanceof Error ? err.message : String(err)}`]),
+            artifacts,
+            consoleErrors,
+            networkErrors
+        };
+        await writeReport(runDir, result);
+        return result;
+    }
+    finally {
+        try {
+            await browser?.close();
+        }
+        catch { /* noop */ }
+    }
+}
 async function runBrowserMission(options) {
     const runDir = await dist_createRunDirectory(options.paths);
     const steps = [];
@@ -42639,6 +43572,19 @@ async function runBrowserMission(options) {
         };
         await writeReport(runDir, result);
         return result;
+    }
+    // Agent-replay missions are the cheapest path: a previously-recorded trace
+    // is re-executed deterministically, no LLM cost. If replay drifts (UI moved),
+    // we fall back to fresh agent exploration provided an agent caller is set.
+    const agentReplay = options.mission.agentReplay;
+    if (agentReplay) {
+        return await runAgentReplayMission(options, runDir, steps, evidence, artifacts, consoleErrors, networkErrors, agentReplay);
+    }
+    // Agent-brief missions skip flow lookup entirely — the agent figures out
+    // the moves at runtime. Legacy path (recorded flow + replayFlow) below.
+    const agentBrief = options.mission.agentBrief;
+    if (agentBrief && options.agent) {
+        return await runAgentMission(options, runDir, steps, evidence, artifacts, consoleErrors, networkErrors, agentBrief);
     }
     const flows = await readFlows(options.paths);
     const flow = flows.find((item) => item.id === options.mission.selectedFlows[0]?.flowId);
@@ -43682,6 +44628,9 @@ class MintApi {
     postJudge(id, ask) {
         return this.request("POST", `/api/v1/runs/${id}/judge`, ask);
     }
+    postAgentTurn(id, body) {
+        return this.request("POST", `/api/v1/runs/${id}/agent-turn`, body);
+    }
     syncFlows(repoId, flows) {
         return this.request("POST", `/api/v1/flows/sync`, {
             repoId,
@@ -43707,6 +44656,26 @@ function makeJudgeBridge(api, runId) {
         // Expect the API to return {text, inputTokens, outputTokens}
         // If it doesn't, we'll get a runtime error (fine for v1)
         return response;
+    };
+}
+
+;// CONCATENATED MODULE: ./src/agent-bridge.ts
+/**
+ * Wraps our API's agent-turn endpoint into the AgentCaller interface the
+ * browser-side agent loop expects. Each call forwards a full Anthropic-style
+ * conversation (system + messages + tools) and returns the assistant's
+ * response (text and/or tool_use blocks) verbatim so the agent can dispatch
+ * tools locally and resume.
+ */
+function makeAgentBridge(api, runId) {
+    return async (opts) => {
+        const res = await api.postAgentTurn(runId, {
+            system: opts.system,
+            messages: opts.messages,
+            tools: opts.tools,
+            maxTokens: opts.maxTokens
+        });
+        return res;
     };
 }
 
@@ -45344,6 +46313,7 @@ async function uploadMedia(opts) {
 
 
 
+
 async function run() {
     // Composite wrapper sets these env vars; fall back to core.getInput for local tests.
     const apiKey = process.env.MINT_API_KEY || core.getInput("api-key", { required: true });
@@ -45383,13 +46353,16 @@ async function run() {
         }
     }
     const judge = makeJudgeBridge(api, missionId);
+    const agent = makeAgentBridge(api, missionId);
     let stepIndex = 0;
-    core.info("Running browser mission…");
+    const briefAny = mission.agentBrief;
+    core.info(briefAny ? "Running agent-brief mission…" : "Running recorded-flow mission…");
     const result = await runBrowserMission({
         mission: mission,
         config,
         paths,
         llm: judge,
+        agent,
         headed: false
     });
     // Browser runner creates its own runDir under <cwd>/.mint/runs/<uuid> and
@@ -45516,6 +46489,18 @@ async function run() {
     catch (err) {
         core.warning(`Video upload failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    // Read the agent trace if this was an agent run (browser wrote it to disk).
+    let agentTrace;
+    const tracePath = reportDir ? external_node_path_default().join(reportDir, "agent-trace.json") : "";
+    if (tracePath && external_node_fs_default().existsSync(tracePath)) {
+        try {
+            agentTrace = JSON.parse(external_node_fs_default().readFileSync(tracePath, "utf8"));
+            core.info(`Agent trace loaded: ${agentTrace?.length ?? 0} tool calls.`);
+        }
+        catch (err) {
+            core.warning(`Failed to read agent trace: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
     // Post completion
     core.info("Posting completion…");
     await api.postComplete(missionId, {
@@ -45525,7 +46510,8 @@ async function run() {
         networkErrors: result.networkErrors ?? [],
         suggestedFix: result.suggestedFix,
         videoUrl,
-        previewUrl
+        previewUrl,
+        agentTrace
     });
     core.info(`Result: ${result.status}`);
     if (result.status !== "passed" && result.status !== "skipped" && result.status !== "not_browser_testable") {
