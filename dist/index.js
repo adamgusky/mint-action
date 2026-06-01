@@ -42758,7 +42758,7 @@ const AGENT_TOOLS = [
     },
     {
         name: "peek",
-        description: "Snapshot the current page. Returns visible buttons, links, inputs, nav landmarks (tabs/sidebar/breadcrumbs), URL, and a sample of visible text. Use this OFTEN — every time you need to decide what to do next, look first.",
+        description: "Snapshot the current page. Returns BOTH a structured text listing (buttons, links, inputs, tabs, nav, URL) AND a screenshot image of what the page actually looks like. Use this OFTEN — every time you need to decide what to do next, look first. The image is critical: it shows visual state the text can't (loading spinners, image previews, completed/incomplete steps in a wizard tracker, error toasts).",
         input_schema: {
             type: "object",
             properties: {
@@ -43264,6 +43264,22 @@ async function runAgent(input) {
                     else if (name === "peek") {
                         const snap = await snapshotPage(page);
                         resultText = formatSnapshot(snap);
+                        // ALSO grab a screenshot so the LLM can see the page visually.
+                        // Bypass the normal text-result path below by returning early
+                        // with a multimodal content array.
+                        const png = await page.screenshot({ fullPage: false, type: "png" }).catch(() => null);
+                        trace.push({ tool: name, input: inp, ok: true, result: resultText.slice(0, 400) });
+                        toolResults.push({
+                            type: "tool_result",
+                            tool_use_id: b.id,
+                            content: png
+                                ? [
+                                    { type: "text", text: resultText.length > 6000 ? resultText.slice(0, 6000) + "\n…(truncated)" : resultText },
+                                    { type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }
+                                ]
+                                : resultText
+                        });
+                        continue;
                     }
                     else if (name === "click") {
                         const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any");
