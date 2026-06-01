@@ -43050,7 +43050,27 @@ async function clickByLabel(page, label, kind) {
             }
         }
     }
-    return { ok: false, detail: `No clickable ${kind} found matching "${label}". Peek the page to see what's actually visible.` };
+    // FALLBACK: modern UIs use <div onClick=...> for cards, tiles, custom
+    // controls. Playwright's getByText().click() climbs to whatever ancestor
+    // is actually clickable. Try it before giving up.
+    try {
+        const textLoc = page.getByText(label, { exact: false }).first();
+        if (await textLoc.count().catch(() => 0)) {
+            const visible = await textLoc.isVisible({ timeout: 500 }).catch(() => false);
+            if (visible) {
+                await textLoc.click({ timeout: 4000 });
+                return { ok: true, detail: `Clicked "${label}" via text-match (likely a div-with-click-handler card or tile).` };
+            }
+        }
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/intercepts pointer events/i.test(msg)) {
+            return { ok: false, detail: `Text-match click for "${label}" was intercepted by an overlay. Try press_key("Escape") first.` };
+        }
+        // Fall through to "not found".
+    }
+    return { ok: false, detail: `No clickable element found matching "${label}" (tried button/link/tab/text-match). Peek the page to see what's actually visible.` };
 }
 async function fillByLabel(page, field, value) {
     const safe = field.replace(/"/g, '\\"');
