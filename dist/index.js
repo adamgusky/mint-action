@@ -42769,12 +42769,13 @@ const AGENT_TOOLS = [
     },
     {
         name: "click",
-        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, the page state usually changes — peek again before deciding the next move.",
+        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, peek again before deciding the next move. NEVER click controls labeled cancel/dismiss/close/back/discard/abort/reset/skip — those destroy your progress; we refuse them by default. If you ACTUALLY want to abort an in-flight task (e.g. close a modal you opened by mistake), pass confirm_destructive=true.",
         input_schema: {
             type: "object",
             properties: {
                 label: { type: "string", description: "Visible text of the control to click." },
-                kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any')." }
+                kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any')." },
+                confirm_destructive: { type: "boolean", description: "Opt-in flag for destructive labels (cancel/close/etc.). Default false — leave unset for normal forward clicks." }
             },
             required: ["label"]
         }
@@ -42825,7 +42826,24 @@ const AGENT_TOOLS = [
         }
     }
 ];
-function systemPromptFor(input) {
+function systemPromptFor(input, progress) {
+    const criteriaWithStatus = input.successCriteria
+        .map((c, i) => {
+        const done = progress?.passedCriteria.has(c) ? "[✓ DONE]" : "[ ] pending";
+        return `  ${i + 1}. ${done} ${c}`;
+    })
+        .join("\n");
+    const recentTrace = progress?.recentTools.length
+        ? `RECENT ACTIONS (last ${progress.recentTools.length}):
+${progress.recentTools.map((t, i) => {
+            const idx = progress.recentTools.length - i;
+            const inp = JSON.stringify(t.input).slice(0, 80);
+            return `  -${idx}: ${t.ok ? "✓" : "✗"} ${t.tool}(${inp})`;
+        }).join("\n")}
+
+If your recent actions look repetitive (same tool + same input twice in a row), CHANGE STRATEGY. Repeating a click on an already-selected item, or peeking twice without acting, is wasted budget. Pick a different forward action.
+`
+        : "";
     return `You are Mint, an in-browser test agent. You drive a real Playwright-controlled browser through user flows in the application under test.
 
 GOAL: ${input.goal}
@@ -42833,23 +42851,25 @@ GOAL: ${input.goal}
 ENTRY: ${input.entryUrl}
 
 SUCCESS CRITERIA (every one must be verifiably satisfied before you call complete with status="passed"):
-${input.successCriteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}
+${criteriaWithStatus}
 
 ${input.hints?.length ? `HINTS FROM CODE READING:\n${input.hints.map((h) => `  - ${h}`).join("\n")}\n` : ""}
-
+${recentTrace}
 OPERATING PRINCIPLES
-- You are stateless across turns: each turn you only see the tool results so far. Always peek the page before deciding what to do next when you're unsure of the current state.
+- You are stateless across turns. Always peek the page before deciding what to do next when you're unsure of the current state.
 - Multi-step UIs are normal. Wizards, modals, expand/collapse panels, tabs inside settings pages, async backend work that takes 5-30s to finish — assume all of these. After clicking a control that triggers work, peek again to see what changed before doing the next thing.
-- Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section (e.g. "image settings" inside /settings), peek and click the visible nav/tab. Tabs and sidebar items are normal UI — they show up as buttons/links in peek output.
-- **NEVER use press_key for navigation.** No Tab, PageDown, End, Home, arrow keys. Those are dead-end exploration — you can't see where focus is, and the next peek won't tell you anything new. The ONLY valid uses of press_key are: Escape (dismiss a modal you can't otherwise close) or Enter (submit a focused input when no explicit submit button exists).
-- Disabled controls = the app is waiting on a required input. If the forward button (Continue, Next, Submit, Generate, Save) is marked [DISABLED] in peek, look at the visible inputs and visible text — there is almost always an unfilled required field (often marked *, "required", or hinted at in placeholder text). Fill it, then peek again, then click the now-enabled forward button. Do not try keyboard tricks to bypass the disabled state.
-- Modal overlays intercept clicks on the page underneath. If you see a modal/dialog, interact with controls INSIDE the modal (or press Escape to dismiss it) before trying to reach the page beneath.
-- When a success criterion is satisfied, verify it with assert_visible before calling complete.
+- Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section (e.g. "image settings" inside /settings), peek and click the visible nav/tab.
+- **NEVER click destructive controls** labeled cancel/dismiss/close/back/discard/abort/reset/clear/skip — they destroy your in-flight progress. The system refuses these clicks by default. Only use them when explicitly aborting an unwanted modal you opened by mistake; pass confirm_destructive=true.
+- **NEVER use press_key for navigation.** No Tab, PageDown, End, Home, arrow keys. The ONLY valid uses of press_key are: Escape (dismiss a modal you can't otherwise close) or Enter (submit a focused input when no explicit submit button exists).
+- **NEVER repeat the same action twice in a row** — if a click looked successful but the page didn't change (tool result includes "⚠️ No observable effect"), the action was either already done OR hit the wrong target. Don't retry — peek, look at the screenshot, pick a DIFFERENT action.
+- Disabled controls = app waiting on a required input. If the forward button is [DISABLED] in peek, fill the visible inputs first.
+- Modal overlays intercept clicks on the page underneath. Interact with controls INSIDE the modal (or press Escape to dismiss) before reaching the page beneath.
+- After completing each success criterion, verify it with assert_visible — that marks it [✓ DONE] in your progress tracker above.
 
 EFFICIENCY
-- Don't peek twice in a row without acting. If your last tool was peek and you didn't learn something that changed your plan, just act.
-- Aim to make forward progress every 1-2 turns. If you've taken 5+ turns without visible progress (URL unchanged, no new content), step back: peek, identify the SINGLE most likely forward control, click it.
-- When you reach the goal state, verify with assert_visible then immediately call complete — don't pile on extra checks.`;
+- Don't peek twice in a row without acting.
+- Aim to make forward progress every 1-2 turns. If 5+ turns have passed with no new [✓ DONE] criteria, step back: re-read your progress + recent actions, pick the SINGLE most likely forward control, click it.
+- When all success criteria show [✓ DONE], call complete with status="passed" immediately. Don't add extra checks.`;
 }
 function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
     if (/^https?:\/\//i.test(pathOrUrl))
@@ -43017,7 +43037,21 @@ function pickElementHandle(page, label, kind) {
         selectors.push(`[aria-label*="${safe}" i]`);
     return selectors.map((s) => page.locator(s));
 }
-async function clickByLabel(page, label, kind) {
+/**
+ * Labels that destroy in-flight agent progress when clicked accidentally.
+ * Wizards almost always show a prominent Cancel button — when the LLM is
+ * uncertain about which forward control to use, it gravitates to Cancel
+ * because it's the most obvious "do something" button. Refuse the click
+ * unless the agent explicitly opted in via `confirm_destructive=true`.
+ */
+const DESTRUCTIVE_LABEL = /^(cancel|dismiss|close|back|discard|abort|reset|clear|undo|skip|exit|leave)\b/i;
+async function clickByLabel(page, label, kind, options = {}) {
+    if (DESTRUCTIVE_LABEL.test(label.trim()) && !options.confirmDestructive) {
+        return {
+            ok: false,
+            detail: `Refused: "${label}" looks like a destructive control (cancel/dismiss/close/back/discard/abort/reset/etc). Clicking it usually loses agent progress. If you ACTUALLY mean to abort, retry with confirm_destructive=true. Otherwise pick a forward control from peek output.`
+        };
+    }
     const locators = pickElementHandle(page, label, kind);
     for (const loc of locators) {
         const count = await loc.count().catch(() => 0);
@@ -43050,16 +43084,50 @@ async function clickByLabel(page, label, kind) {
             }
         }
     }
-    // FALLBACK: modern UIs use <div onClick=...> for cards, tiles, custom
-    // controls. Playwright's getByText().click() climbs to whatever ancestor
-    // is actually clickable. Try it before giving up.
+    // FALLBACK: modern UIs use <div onClick=...> for cards/tiles/custom controls.
+    // Playwright's getByText().click() would climb to ANY ancestor with a
+    // click handler — but that includes whole <section>s, headings whose parent
+    // section has a click handler, etc. So we only fall back when the matched
+    // node OR an ancestor within 3 hops is clearly interactive (role, button,
+    // a[href], [onclick], tabindex>=0). Otherwise return "not found" so the
+    // agent reconsiders instead of accidentally clicking page chrome.
     try {
         const textLoc = page.getByText(label, { exact: false }).first();
         if (await textLoc.count().catch(() => 0)) {
             const visible = await textLoc.isVisible({ timeout: 500 }).catch(() => false);
             if (visible) {
+                const isInteractive = await textLoc.evaluate((el) => {
+                    const INTERACTIVE_TAGS = new Set(["BUTTON", "A", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
+                    const INTERACTIVE_ROLES = new Set(["button", "link", "tab", "menuitem", "checkbox", "radio", "switch", "option"]);
+                    let node = el;
+                    for (let hops = 0; hops < 4 && node; hops++) {
+                        if (INTERACTIVE_TAGS.has(node.tagName))
+                            return true;
+                        const role = node.getAttribute("role");
+                        if (role && INTERACTIVE_ROLES.has(role))
+                            return true;
+                        if (node.hasAttribute("onclick"))
+                            return true;
+                        const tab = node.getAttribute("tabindex");
+                        if (tab !== null && Number(tab) >= 0)
+                            return true;
+                        // React-style click handlers often manifest as `cursor-pointer` class
+                        // on otherwise-inert divs. Cheap heuristic.
+                        const cls = node.getAttribute("class") ?? "";
+                        if (/(?:^|\s)cursor-pointer(?:\s|$)/.test(cls))
+                            return true;
+                        node = node.parentElement;
+                    }
+                    return false;
+                }).catch(() => false);
+                if (!isInteractive) {
+                    return {
+                        ok: false,
+                        detail: `Text "${label}" was found on the page but it's not inside an interactive element (no button/link/role=button/onclick/cursor-pointer within 3 ancestors). It's probably a heading, paragraph, or label — not something you can click. Peek to see real buttons/links.`
+                    };
+                }
                 await textLoc.click({ timeout: 4000 });
-                return { ok: true, detail: `Clicked "${label}" via text-match (likely a div-with-click-handler card or tile).` };
+                return { ok: true, detail: `Clicked "${label}" via text-match (a div-with-click-handler card/tile).` };
             }
         }
     }
@@ -43113,6 +43181,33 @@ async function fillByLabel(page, field, value) {
     }
     return { ok: false, detail: `No input found matching "${field}". Peek to see available inputs.` };
 }
+async function pageStateHash(page) {
+    try {
+        return await page.evaluate(() => {
+            const url = location.href;
+            // Hash from visible text + interactive element counts. Not crypto-secure;
+            // just needs to be stable + fast.
+            const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+            const buttons = document.querySelectorAll("button, [role='button']").length;
+            const inputs = document.querySelectorAll("input, textarea, select").length;
+            const links = document.querySelectorAll("a[href]").length;
+            // djb2 hash — small + good enough to detect change.
+            let h = 5381;
+            const seed = `${buttons}|${inputs}|${links}|${text.slice(0, 12000)}`;
+            for (let i = 0; i < seed.length; i++)
+                h = ((h << 5) + h) ^ seed.charCodeAt(i);
+            return { url, bodyHash: (h >>> 0).toString(16) };
+        });
+    }
+    catch {
+        return { url: "", bodyHash: "" };
+    }
+}
+function stateUnchanged(before, after) {
+    if (!before.bodyHash || !after.bodyHash)
+        return false;
+    return before.url === after.url && before.bodyHash === after.bodyHash;
+}
 async function captureScreenshot(page, runDir, index) {
     const dir = external_node_path_namespaceObject.join(runDir, "step-screenshots");
     await (0,external_node_fs_promises_namespaceObject.mkdir)(dir, { recursive: true });
@@ -43149,7 +43244,10 @@ async function runAgentReplay(input) {
                 steps.push(resultText);
             }
             else if (entry.tool === "click") {
-                const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any");
+                // Replay path: trust the recorded trace. If the original run included
+                // a destructive click, it was either intentional or replay is going
+                // to drift anyway — let it through.
+                const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any", { confirmDestructive: true });
                 ok = out.ok;
                 resultText = out.detail;
                 if (ok)
@@ -43235,7 +43333,6 @@ async function runAgent(input) {
     catch {
         /* non-fatal — agent can navigate via tool */
     }
-    const system = systemPromptFor(input);
     const messages = [{
             role: "user",
             content: `You are now in the browser at the entry page. Peek to see what's there, then proceed toward the goal. Call complete when every success criterion is verifiably satisfied (or when you're confident you can't proceed).`
@@ -43243,10 +43340,19 @@ async function runAgent(input) {
     let turns = 0;
     let toolCalls = 0;
     let verdict = null;
+    // Track which success criteria have been verified so we can render
+    // "[✓ DONE] / [ ] pending" in the system prompt every turn.
+    const passedCriteria = new Set();
     while (turns < maxTurns && !verdict) {
         turns++;
         let response;
         try {
+            // Rebuild the system prompt each turn with current progress + last
+            // few actions so the LLM can't lose track of where it is.
+            const system = systemPromptFor(input, {
+                passedCriteria,
+                recentTools: trace.slice(-6).map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
+            });
             response = await agent({ system, messages, tools: AGENT_TOOLS, maxTokens: 2048 });
         }
         catch (err) {
@@ -43275,26 +43381,39 @@ async function runAgent(input) {
                 try {
                     if (name === "navigate") {
                         const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
+                        const before = await pageStateHash(page);
                         await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
                         resultText = `Navigated to ${target}.`;
                         steps.push(`Navigated to ${target}.`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
+                        const after = await pageStateHash(page);
+                        if (stateUnchanged(before, after)) {
+                            resultText += `\n⚠️ Already on this URL — page didn't change. Don't navigate here again; pick a different next step (click into nav, fill a form, etc.).`;
+                        }
                     }
                     else if (name === "peek") {
                         const snap = await snapshotPage(page);
-                        resultText = formatSnapshot(snap);
-                        // ALSO grab a screenshot so the LLM can see the page visually.
-                        // Bypass the normal text-result path below by returning early
-                        // with a multimodal content array.
+                        const baseText = formatSnapshot(snap);
+                        // Multimodal: include a screenshot so the LLM can SEE visual state
+                        // (selected cards have a colored ring, pending generations have a
+                        // spinner, success ticks, etc.) that DOM text scraping misses.
                         const png = await page.screenshot({ fullPage: false, type: "png" }).catch(() => null);
-                        trace.push({ tool: name, input: inp, ok: true, result: resultText.slice(0, 400) });
+                        const visualHint = png
+                            ? `\n\nVISUAL CHECK (read the screenshot, don't just read the text above):
+- Are any items already SELECTED (colored border, check mark, "Selected (N of M)" counter)? If so, do NOT click them again.
+- Is anything LOADING (spinner, "Generating…", skeleton placeholder)? If so, wait or peek again rather than acting.
+- Is there a success indicator visible (green check, "Saved", "Created")? That probably means a previous action already succeeded.
+- Compare this screenshot to the previous one mentally. What changed? What stayed the same? Use that to decide your next action.`
+                            : "";
+                        resultText = baseText + visualHint;
+                        trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 400) });
                         toolResults.push({
                             type: "tool_result",
                             tool_use_id: b.id,
                             content: png
                                 ? [
-                                    { type: "text", text: resultText.length > 6000 ? resultText.slice(0, 6000) + "\n…(truncated)" : resultText },
+                                    { type: "text", text: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText },
                                     { type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }
                                 ]
                                 : resultText
@@ -43302,7 +43421,8 @@ async function runAgent(input) {
                         continue;
                     }
                     else if (name === "click") {
-                        const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any");
+                        const before = await pageStateHash(page);
+                        const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any", { confirmDestructive: inp.confirm_destructive === true });
                         ok = out.ok;
                         resultText = out.detail;
                         if (out.ok) {
@@ -43310,9 +43430,15 @@ async function runAgent(input) {
                             await page.waitForTimeout(400);
                             await captureScreenshot(page, runDir, steps.length);
                             await input.onScreenshot?.(steps.length);
+                            const after = await pageStateHash(page);
+                            if (stateUnchanged(before, after)) {
+                                resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state OR the click hit a non-interactive node. DO NOT click the same label again — peek and pick a different action.`;
+                                ok = false;
+                            }
                         }
                     }
                     else if (name === "fill") {
+                        const before = await pageStateHash(page);
                         const out = await fillByLabel(page, String(inp.field ?? ""), String(inp.value ?? ""));
                         ok = out.ok;
                         resultText = out.detail;
@@ -43320,16 +43446,25 @@ async function runAgent(input) {
                             steps.push(out.detail);
                             await captureScreenshot(page, runDir, steps.length);
                             await input.onScreenshot?.(steps.length);
+                            const after = await pageStateHash(page);
+                            if (stateUnchanged(before, after)) {
+                                resultText += `\n⚠️ No observable effect: page unchanged after fill. The input may already hold this value, or fill targeted the wrong field. Don't repeat — peek and verify.`;
+                            }
                         }
                     }
                     else if (name === "press_key") {
                         const key = String(inp.key ?? "Escape");
+                        const before = await pageStateHash(page);
                         await page.keyboard.press(key);
                         await page.waitForTimeout(300);
                         resultText = `Pressed ${key}.`;
                         steps.push(`Pressed ${key}.`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
+                        const after = await pageStateHash(page);
+                        if (stateUnchanged(before, after)) {
+                            resultText += `\n⚠️ No observable effect: page unchanged after pressing ${key}. Don't repeat this key — pick a different action.`;
+                        }
                     }
                     else if (name === "assert_visible") {
                         const text = String(inp.text ?? "");
@@ -43340,6 +43475,22 @@ async function runAgent(input) {
                         steps.push(found ? `Asserted "${text}" is visible.` : `Could not verify "${text}".`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
+                        // Update the progress tracker: a success criterion is "done" when
+                        // any of its keywords show up via assert_visible. Substring match
+                        // both ways so the agent can assert specific text that's part of
+                        // the criterion (or assert the whole criterion verbatim).
+                        if (found) {
+                            const tLower = text.toLowerCase();
+                            for (const crit of input.successCriteria) {
+                                if (passedCriteria.has(crit))
+                                    continue;
+                                const cLower = crit.toLowerCase();
+                                if (cLower.includes(tLower) || tLower.includes(cLower.slice(0, 30))) {
+                                    passedCriteria.add(crit);
+                                    resultText += `\n✓ Marked success criterion as DONE: "${crit.slice(0, 80)}…"`;
+                                }
+                            }
+                        }
                     }
                     else if (name === "complete") {
                         const status = inp.status ?? "blocked";
