@@ -42769,13 +42769,14 @@ const AGENT_TOOLS = [
     },
     {
         name: "click",
-        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, peek again before deciding the next move. NEVER click controls labeled cancel/dismiss/close/back/discard/abort/reset/skip — those destroy your progress; we refuse them by default. If you ACTUALLY want to abort an in-flight task (e.g. close a modal you opened by mistake), pass confirm_destructive=true.",
+        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, peek again before deciding the next move. NEVER click controls labeled cancel/dismiss/close/back/discard/abort/reset/skip — those destroy your progress. To actually abort an unwanted modal you opened by mistake, pass BOTH confirm_destructive=true AND giving_up_on_criterion=\"<exact text of the success criterion you're abandoning>\". REPEAT-CLICKING the same label twice in a row is hard-blocked — peek + change strategy instead.",
         input_schema: {
             type: "object",
             properties: {
                 label: { type: "string", description: "Visible text of the control to click." },
                 kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any')." },
-                confirm_destructive: { type: "boolean", description: "Opt-in flag for destructive labels (cancel/close/etc.). Default false — leave unset for normal forward clicks." }
+                confirm_destructive: { type: "boolean", description: "Opt-in flag for destructive labels. Only set when truly aborting." },
+                giving_up_on_criterion: { type: "string", description: "Required when confirm_destructive=true. The exact success-criterion text you're abandoning by clicking this cancel/close. If you can't name one, don't cancel." }
             },
             required: ["label"]
         }
@@ -43046,11 +43047,19 @@ function pickElementHandle(page, label, kind) {
  */
 const DESTRUCTIVE_LABEL = /^(cancel|dismiss|close|back|discard|abort|reset|clear|undo|skip|exit|leave)\b/i;
 async function clickByLabel(page, label, kind, options = {}) {
-    if (DESTRUCTIVE_LABEL.test(label.trim()) && !options.confirmDestructive) {
-        return {
-            ok: false,
-            detail: `Refused: "${label}" looks like a destructive control (cancel/dismiss/close/back/discard/abort/reset/etc). Clicking it usually loses agent progress. If you ACTUALLY mean to abort, retry with confirm_destructive=true. Otherwise pick a forward control from peek output.`
-        };
+    if (DESTRUCTIVE_LABEL.test(label.trim())) {
+        if (!options.confirmDestructive) {
+            return {
+                ok: false,
+                detail: `Refused: "${label}" looks like a destructive control (cancel/dismiss/close/back/discard/abort/reset/etc). Clicking it loses your progress. If you ACTUALLY mean to abort an unwanted modal, retry with BOTH confirm_destructive=true AND giving_up_on_criterion="<exact text of the success criterion you're abandoning>". Otherwise pick a forward control from peek output.`
+            };
+        }
+        if (!options.givingUpOnCriterion || options.givingUpOnCriterion.trim().length < 8) {
+            return {
+                ok: false,
+                detail: `Refused: confirm_destructive=true requires giving_up_on_criterion="<exact text of the success criterion you're abandoning>". Articulate which goal you're giving up on (e.g. "Exactly 1 of the 3 originally-scheduled articles remains visible"). If you can't name a criterion to give up on, you don't actually want to cancel — pick a forward action instead.`
+            };
+        }
     }
     const locators = pickElementHandle(page, label, kind);
     for (const loc of locators) {
@@ -43421,19 +43430,35 @@ async function runAgent(input) {
                         continue;
                     }
                     else if (name === "click") {
-                        const before = await pageStateHash(page);
-                        const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any", { confirmDestructive: inp.confirm_destructive === true });
-                        ok = out.ok;
-                        resultText = out.detail;
-                        if (out.ok) {
-                            steps.push(out.detail);
-                            await page.waitForTimeout(400);
-                            await captureScreenshot(page, runDir, steps.length);
-                            await input.onScreenshot?.(steps.length);
-                            const after = await pageStateHash(page);
-                            if (stateUnchanged(before, after)) {
-                                resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state OR the click hit a non-interactive node. DO NOT click the same label again — peek and pick a different action.`;
-                                ok = false;
+                        const label = String(inp.label ?? "");
+                        // HARD-REFUSE: if the previous click was on this same label,
+                        // it's almost certainly a loop. The LLM should peek + pick
+                        // a different target. No opt-out — even confirm_destructive
+                        // can't bypass this, the agent must change strategy.
+                        const lastClick = [...trace].reverse().find((t) => t.tool === "click");
+                        if (lastClick && String((lastClick.input ?? {}).label ?? "").toLowerCase() === label.toLowerCase()) {
+                            const refusal = `Refused: you just clicked "${label}" on the previous turn. Repeating the same click never helps — either the action already succeeded (so peek to verify and move on) OR the label matched the wrong element (so peek and try a different label). Pick a DIFFERENT next action.`;
+                            ok = false;
+                            resultText = refusal;
+                        }
+                        else {
+                            const before = await pageStateHash(page);
+                            const out = await clickByLabel(page, label, inp.kind ?? "any", {
+                                confirmDestructive: inp.confirm_destructive === true,
+                                givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
+                            });
+                            ok = out.ok;
+                            resultText = out.detail;
+                            if (out.ok) {
+                                steps.push(out.detail);
+                                await page.waitForTimeout(400);
+                                await captureScreenshot(page, runDir, steps.length);
+                                await input.onScreenshot?.(steps.length);
+                                const after = await pageStateHash(page);
+                                if (stateUnchanged(before, after)) {
+                                    resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state OR the click hit a non-interactive node. DO NOT click the same label again — peek and pick a different action.`;
+                                    ok = false;
+                                }
                             }
                         }
                     }
