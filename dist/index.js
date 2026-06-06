@@ -41749,6 +41749,12 @@ The brief has four pieces:
 
 3. **successCriteria** (array of 1-4 short strings): Concrete, observable conditions that must ALL be true for the test to be a "pass". These are what the agent will assert via assert_visible at the end. Pull text or controls that you have ACTUALLY SEEN in the source files. Examples: "The text 'Review Outline' is visible on the page.", "An image preview appears in the Test Image Generation panel."
 
+   **CRITICAL: preserve the user's stated END-STATE.** When the developer says "...and see X appear on the dashboard" or "...and Y is removed from the list" or "...and the new item shows in the table" — THAT is the criterion. Quote it close to verbatim. Do NOT weaken it to an intermediate state because of async/streaming/loading. If the post-action UI takes time to update, the agent can wait, retry, or extend timeouts — that's its job. Watering down hides real failures.
+   - Bad (hides failure): "The 'Schedule Articles' button is clickable" — when the user asked to "see 3 newly scheduled article rows appear"
+   - Good (verifies the real outcome): "3 newly scheduled article rows are visible in the dashboard articles list"
+   - Bad: "A planning indicator appears after clicking Submit" — when the user asked for "the new entry appears in the History table"
+   - Good: "The new entry appears in the History table after submit"
+
 4. **hints** (array of 0-5 short strings, optional): Non-prescriptive nuggets from your code reading that help the agent. Use these for non-obvious facts about the UI — never use them to write step-by-step instructions. Good hint: "The image playground lives inside the Image tab of Settings — it's not at /settings/images." Bad hint: "Click the Image tab, then expand the panel, then fill the prompt."
 
 5. **persona**: Pick the mint.yml persona id whose plan/data unlocks this flow.
@@ -43669,8 +43675,27 @@ async function runAgent(input) {
                     else if (name === "complete") {
                         const status = inp.status ?? "blocked";
                         const summary = String(inp.summary ?? "");
-                        verdict = { status, summary, toolCalls, turns, trace };
-                        resultText = `Run marked ${status}.`;
+                        // Hard gate: passed requires every success criterion to be [✓ DONE].
+                        // Without this, the agent can declare success on the intent (e.g.,
+                        // "clicked Schedule Articles, modal advanced") without verifying
+                        // the END state the user actually asked for ("3 new rows appear
+                        // on the dashboard"). Refusing here forces the agent to keep
+                        // going until the literal post-state is observable.
+                        if (status === "passed") {
+                            const pending = input.successCriteria.filter((c) => !passedCriteria.has(c));
+                            if (pending.length > 0) {
+                                ok = false;
+                                resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending:\n${pending.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}\n\nEach pending criterion must be marked [✓ DONE] by asserting (assert_visible) against the END state described in the criterion — not an intermediate step. Keep going: finish the flow, observe the final UI, then assert each criterion's text. If you genuinely cannot reach the end state (real blocker, env issue, missing feature), call complete(status="blocked", summary=...) or complete(status="failed", summary=...) instead.`;
+                            }
+                            else {
+                                verdict = { status, summary, toolCalls, turns, trace };
+                                resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified).`;
+                            }
+                        }
+                        else {
+                            verdict = { status, summary, toolCalls, turns, trace };
+                            resultText = `Run marked ${status}.`;
+                        }
                     }
                     else {
                         ok = false;
