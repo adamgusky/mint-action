@@ -42758,7 +42758,7 @@ const AGENT_TOOLS = [
     },
     {
         name: "peek",
-        description: "Snapshot the current page. Returns BOTH a structured text listing (buttons, links, inputs, tabs, nav, URL) AND a screenshot image of what the page actually looks like. Use this OFTEN — every time you need to decide what to do next, look first. The image is critical: it shows visual state the text can't (loading spinners, image previews, completed/incomplete steps in a wizard tracker, error toasts).",
+        description: "Snapshot the current page as compact text only — each interactive element gets a stable ref like @e1, @e2 you can pass back to click/fill. NO screenshot image (saves ~70KB tokens per call). Use this as your default 'look at the page' tool. Only use peek_visual when you specifically need to see VISUAL state that text scraping can't show (selection rings, loading spinners, image previews, success ticks, wizard step indicators).",
         input_schema: {
             type: "object",
             properties: {
@@ -42768,29 +42768,41 @@ const AGENT_TOOLS = [
         }
     },
     {
-        name: "click",
-        description: "Click a button, link, or tab matched by its visible label. Match is case-insensitive substring. If multiple elements match, the first enabled one wins. After clicking, peek again before deciding the next move. NEVER click controls labeled cancel/dismiss/close/back/discard/abort/reset/skip — those destroy your progress. To actually abort an unwanted modal you opened by mistake, pass BOTH confirm_destructive=true AND giving_up_on_criterion=\"<exact text of the success criterion you're abandoning>\". REPEAT-CLICKING the same label twice in a row is hard-blocked — peek + change strategy instead.",
+        name: "peek_visual",
+        description: "Like peek, but ALSO returns a screenshot image. Costs ~10× more tokens. Use sparingly — only when text alone can't tell you what you need (which card is selected? is the spinner still spinning? is the image preview rendered? did the success toast appear?).",
         input_schema: {
             type: "object",
             properties: {
-                label: { type: "string", description: "Visible text of the control to click." },
-                kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any')." },
-                confirm_destructive: { type: "boolean", description: "Opt-in flag for destructive labels. Only set when truly aborting." },
-                giving_up_on_criterion: { type: "string", description: "Required when confirm_destructive=true. The exact success-criterion text you're abandoning by clicking this cancel/close. If you can't name one, don't cancel." }
+                reason: { type: "string", description: "Why do you need to see the image specifically? e.g. 'verify the funky-style image actually rendered'" }
             },
-            required: ["label"]
+            required: ["reason"]
+        }
+    },
+    {
+        name: "click",
+        description: "Click a control by REF (preferred, deterministic) or by LABEL fallback. Pass ref=\"e1\" (from the last peek) for unambiguous targeting — refs are cheap and never confuse same-named buttons. NEVER click controls labeled cancel/dismiss/close/back/discard/abort/reset/skip — they destroy your progress. To actually abort an unwanted modal, pass BOTH confirm_destructive=true AND giving_up_on_criterion=\"<criterion you're giving up on>\". REPEAT-CLICKING the same ref or label twice in a row is hard-blocked — peek + change strategy.",
+        input_schema: {
+            type: "object",
+            properties: {
+                ref: { type: "string", description: "Preferred. Element ref from the most recent peek, e.g. \"e1\" or \"@e1\". Refs are populated by both peek tools." },
+                label: { type: "string", description: "Fallback. Visible text of the control. Only use when ref isn't available (e.g. you haven't peeked since the last action)." },
+                kind: { type: "string", enum: ["button", "link", "tab", "any"], description: "Element type (default 'any'). Only matters when using label." },
+                confirm_destructive: { type: "boolean", description: "Opt-in flag for destructive labels." },
+                giving_up_on_criterion: { type: "string", description: "Required when confirm_destructive=true. The exact success criterion you're abandoning." }
+            }
         }
     },
     {
         name: "fill",
-        description: "Type a value into an input matched by its label or placeholder.",
+        description: "Type a value into an input by REF (preferred) or by LABEL/placeholder fallback.",
         input_schema: {
             type: "object",
             properties: {
-                field: { type: "string", description: "Visible label or placeholder of the input." },
+                ref: { type: "string", description: "Preferred. Input ref from the most recent peek, e.g. \"e4\"." },
+                field: { type: "string", description: "Fallback. Visible label or placeholder of the input." },
                 value: { type: "string", description: "Value to type." }
             },
-            required: ["field", "value"]
+            required: ["value"]
         }
     },
     {
@@ -42857,15 +42869,16 @@ ${criteriaWithStatus}
 ${input.hints?.length ? `HINTS FROM CODE READING:\n${input.hints.map((h) => `  - ${h}`).join("\n")}\n` : ""}
 ${recentTrace}
 OPERATING PRINCIPLES
-- You are stateless across turns. Always peek the page before deciding what to do next when you're unsure of the current state.
-- Multi-step UIs are normal. Wizards, modals, expand/collapse panels, tabs inside settings pages, async backend work that takes 5-30s to finish — assume all of these. After clicking a control that triggers work, peek again to see what changed before doing the next thing.
-- Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section (e.g. "image settings" inside /settings), peek and click the visible nav/tab.
-- **NEVER click destructive controls** labeled cancel/dismiss/close/back/discard/abort/reset/clear/skip — they destroy your in-flight progress. The system refuses these clicks by default. Only use them when explicitly aborting an unwanted modal you opened by mistake; pass confirm_destructive=true.
-- **NEVER use press_key for navigation.** No Tab, PageDown, End, Home, arrow keys. The ONLY valid uses of press_key are: Escape (dismiss a modal you can't otherwise close) or Enter (submit a focused input when no explicit submit button exists).
-- **NEVER repeat the same action twice in a row** — if a click looked successful but the page didn't change (tool result includes "⚠️ No observable effect"), the action was either already done OR hit the wrong target. Don't retry — peek, look at the screenshot, pick a DIFFERENT action.
-- Disabled controls = app waiting on a required input. If the forward button is [DISABLED] in peek, fill the visible inputs first.
-- Modal overlays intercept clicks on the page underneath. Interact with controls INSIDE the modal (or press Escape to dismiss) before reaching the page beneath.
-- After completing each success criterion, verify it with assert_visible — that marks it [✓ DONE] in your progress tracker above.
+- **Use refs, not labels.** Every peek returns a stable handle like @e1, @e2 for each interactive element. Pass ref="e1" to click/fill — it's unambiguous and saves tokens. Use label only as a fallback when you haven't peeked since the last action.
+- **peek (text-only) is your default.** It's cheap. Reach for peek_visual ONLY when you need to see something the text can't tell you (selection rings, spinners, image previews, success ticks).
+- Multi-step UIs are normal. Wizards, modals, expand/collapse panels, async backend work taking 5-30s — assume all of these. After triggering work, peek again before the next action.
+- Navigate semantically. Don't guess at URLs beyond the entry. If you need a sub-section, peek and click the visible nav/tab.
+- **NEVER click destructive controls** (cancel/dismiss/close/back/discard/abort/reset/skip). They destroy progress and are refused by default. To genuinely abort, pass BOTH confirm_destructive=true AND giving_up_on_criterion="<the criterion you're abandoning>".
+- **NEVER use press_key for navigation.** No Tab/PageDown/End/Home/arrows. The ONLY valid uses: Escape (dismiss a modal) or Enter (submit a focused input).
+- **NEVER repeat the same action twice in a row.** Hard-blocked at the system level. If a previous click returned "⚠️ No observable effect" — DON'T retry, peek and pick a different target.
+- Disabled controls = app waiting on a required input. Fill the visible empty inputs first.
+- Modal overlays intercept clicks. Interact with controls INSIDE the modal first.
+- After completing each success criterion, verify it with assert_visible — marks it [✓ DONE] in your tracker.
 
 EFFICIENCY
 - Don't peek twice in a row without acting.
@@ -42879,8 +42892,28 @@ function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
     const tail = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
     return base + tail;
 }
+/**
+ * Refs + tagging: every interactive element gets a stable handle (`@e1`,
+ * `@e2`, …) that the agent can pass back to click/fill instead of a fuzzy
+ * label. The ref is stored on the DOM via `data-mint-ref` so we can target
+ * the element directly via CSS selector across turns. Prior refs are wiped
+ * at the start of each snapshot so numbering resets cleanly per peek.
+ *
+ * Adopting Vercel agent-browser's approach without taking their runtime:
+ * we keep Playwright + our agent loop + all our safety guards, and just
+ * pick up the deterministic-handle pattern they pioneered.
+ */
 async function snapshotPage(page) {
     return await page.evaluate(() => {
+        // Wipe any refs left over from a prior peek. Snapshots are point-in-time
+        // and refs from two turns ago aren't valid anymore.
+        document.querySelectorAll("[data-mint-ref]").forEach((el) => el.removeAttribute("data-mint-ref"));
+        let refCounter = 0;
+        const assignRef = (el) => {
+            const ref = `e${++refCounter}`;
+            el.setAttribute("data-mint-ref", ref);
+            return ref;
+        };
         const seen = new WeakSet();
         const visible = (el) => {
             const rect = el.getBoundingClientRect();
@@ -42913,19 +42946,31 @@ async function snapshotPage(page) {
         const modalInputs = [];
         if (modalEl) {
             modalEl.querySelectorAll("button").forEach((b) => {
-                if (visible(b))
-                    modalButtons.push(textOf(b));
+                if (!visible(b))
+                    return;
+                const label = textOf(b);
+                modalButtons.push({ ref: assignRef(b), label, enabled: !b.disabled });
+                seen.add(b);
             });
             modalEl.querySelectorAll("input, textarea").forEach((i) => {
-                if (visible(i))
-                    modalInputs.push(textOf(i) || i.placeholder || "(input)");
+                if (!visible(i))
+                    return;
+                const input = i;
+                const label = input.getAttribute("aria-label") || input.placeholder || input.name || "(input)";
+                modalInputs.push({ ref: assignRef(i), label: String(label).slice(0, 80), value: (input.value || "").slice(0, 80) });
+                seen.add(i);
             });
         }
         document.querySelectorAll('[role="tab"]').forEach((el) => {
-            if (!visible(el))
+            if (!visible(el) || seen.has(el))
                 return;
             seen.add(el);
-            tabs.push({ label: textOf(el), selected: el.getAttribute("aria-selected") === "true" });
+            tabs.push({
+                ref: assignRef(el),
+                label: textOf(el),
+                enabled: !el.disabled,
+                selected: el.getAttribute("aria-selected") === "true"
+            });
         });
         document.querySelectorAll("nav a, [role='navigation'] a, aside a").forEach((el) => {
             if (!visible(el))
@@ -42934,23 +42979,26 @@ async function snapshotPage(page) {
             if (t)
                 nav.push(t);
         });
-        document.querySelectorAll("button").forEach((el) => {
+        document.querySelectorAll("button, [role='button']").forEach((el) => {
             if (!visible(el) || seen.has(el))
                 return;
             const label = textOf(el);
             if (!label)
                 return;
-            buttons.push({ label, enabled: !el.disabled });
+            seen.add(el);
+            buttons.push({ ref: assignRef(el), label, enabled: !el.disabled });
         });
         document.querySelectorAll("a[href]").forEach((el) => {
             if (!visible(el) || seen.has(el))
                 return;
             const label = textOf(el);
-            if (label)
-                links.push({ label });
+            if (!label)
+                return;
+            seen.add(el);
+            links.push({ ref: assignRef(el), label, enabled: true });
         });
         document.querySelectorAll("input, textarea, select").forEach((el) => {
-            if (!visible(el))
+            if (!visible(el) || seen.has(el))
                 return;
             const input = el;
             const label = input.getAttribute("aria-label") ||
@@ -42958,7 +43006,12 @@ async function snapshotPage(page) {
                 (input.labels && input.labels[0]?.textContent) ||
                 input.name ||
                 "(input)";
-            inputs.push({ label: label.toString().trim().slice(0, 80), value: (input.value || "").slice(0, 80) });
+            seen.add(el);
+            inputs.push({
+                ref: assignRef(el),
+                label: label.toString().trim().slice(0, 80),
+                value: (input.value || "").slice(0, 80)
+            });
         });
         document.querySelectorAll("h1, h2, h3, h4, [role='heading'], p, li, label, span").forEach((el) => {
             if (!visible(el))
@@ -42982,46 +43035,50 @@ async function snapshotPage(page) {
 function formatSnapshot(s) {
     const lines = [];
     lines.push(`URL: ${s.url}`);
-    // Flag disabled forward-progress buttons LOUDLY at the top — these are
-    // almost always the agent's blocker and need to be acted on (by filling
-    // a required input), not worked around with keyboard tricks.
     const forwardLabels = /^(continue|next|submit|generate|save|create|add|publish|confirm|done|finish|proceed)\b/i;
     const disabledForwardButtons = s.buttons.filter((b) => !b.enabled && forwardLabels.test(b.label));
     if (disabledForwardButtons.length) {
-        const emptyInputs = s.inputs.filter((i) => !i.value).map((i) => `"${i.label}"`);
+        const emptyInputs = s.inputs.filter((i) => !i.value).map((i) => `@${i.ref} "${i.label}"`);
         lines.push("");
-        lines.push(`!! FORWARD BUTTON DISABLED: ${disabledForwardButtons.map((b) => `"${b.label}"`).join(", ")}`);
-        lines.push(`!! Empty inputs that probably need values: ${emptyInputs.slice(0, 6).join(", ") || "(none visible — scroll/expand may be needed)"}`);
-        lines.push(`!! Fill them, then peek again. Do NOT use press_key to bypass.`);
+        lines.push(`!! FORWARD BUTTON DISABLED: ${disabledForwardButtons.map((b) => `@${b.ref} "${b.label}"`).join(", ")}`);
+        lines.push(`!! Empty inputs that probably need values: ${emptyInputs.slice(0, 6).join(", ") || "(none visible)"}`);
+        lines.push(`!! Fill them, then peek again.`);
         lines.push("");
     }
     if (s.modal.open) {
-        lines.push(`MODAL OPEN: buttons=[${s.modal.buttons.join(" | ") || "(none)"}] inputs=[${s.modal.inputs.join(" | ") || "(none)"}]`);
-        lines.push("(Interact with the modal's controls or press Escape before reaching the page underneath.)");
+        lines.push(`MODAL OPEN.`);
+        lines.push(`  modal buttons: ${s.modal.buttons.map((b) => `@${b.ref} "${b.label}"${b.enabled ? "" : "[DISABLED]"}`).join(" | ") || "(none)"}`);
+        if (s.modal.inputs.length) {
+            lines.push(`  modal inputs: ${s.modal.inputs.map((i) => `@${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : ""}`).join(" | ")}`);
+        }
+        lines.push(`(Interact with controls INSIDE the modal first, or press Escape to dismiss it.)`);
     }
     if (s.tabs.length) {
-        lines.push(`TABS: ${s.tabs.map((t) => `${t.label}${t.selected ? "*" : ""}`).join(" | ")}`);
+        lines.push(`TABS: ${s.tabs.map((t) => `@${t.ref} "${t.label}"${t.selected ? "*" : ""}`).join(" | ")}`);
     }
     if (s.nav.length) {
         lines.push(`NAV: ${s.nav.join(" | ")}`);
     }
+    // Compact ref-first format. Refs are stable handles you can pass back to
+    // click/fill — much cheaper than fuzzy label matching, and they won't
+    // collide when two controls share the same text.
     lines.push(`BUTTONS (${s.buttons.length}):`);
     for (const b of s.buttons)
-        lines.push(`  - "${b.label}"${b.enabled ? "" : " [DISABLED]"}`);
+        lines.push(`  @${b.ref} "${b.label}"${b.enabled ? "" : " [DISABLED]"}`);
     if (s.links.length) {
         lines.push(`LINKS (${s.links.length}):`);
         for (const l of s.links)
-            lines.push(`  - "${l.label}"`);
+            lines.push(`  @${l.ref} "${l.label}"`);
     }
     if (s.inputs.length) {
         lines.push(`INPUTS (${s.inputs.length}):`);
         for (const i of s.inputs)
-            lines.push(`  - "${i.label}"${i.value ? ` (current: "${i.value}")` : " (empty)"}`);
+            lines.push(`  @${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : " (empty)"}`);
     }
     if (s.visibleText.length) {
-        lines.push(`VISIBLE TEXT (first 30):`);
-        for (const t of s.visibleText.slice(0, 30))
-            lines.push(`  - ${t}`);
+        lines.push(`VISIBLE TEXT (first 20):`);
+        for (const t of s.visibleText.slice(0, 20))
+            lines.push(`  ${t}`);
     }
     return lines.join("\n");
 }
@@ -43149,6 +43206,60 @@ async function clickByLabel(page, label, kind, options = {}) {
     }
     return { ok: false, detail: `No clickable element found matching "${label}" (tried button/link/tab/text-match). Peek the page to see what's actually visible.` };
 }
+/** Direct click by ref. Refs are set on the DOM via data-mint-ref by the most
+ *  recent peek; they're unambiguous and bypass the label-matching heuristics. */
+async function clickByRef(page, ref, options = {}) {
+    const selector = `[data-mint-ref="${ref.replace(/^@/, "")}"]`;
+    const loc = page.locator(selector).first();
+    const count = await loc.count().catch(() => 0);
+    if (count === 0) {
+        return { ok: false, detail: `Ref @${ref.replace(/^@/, "")} not found — the page has changed since the last peek. Peek again to get fresh refs.` };
+    }
+    // Read the label off the DOM so we can apply the destructive-label safety check.
+    const label = (await loc.evaluate((el) => el.textContent || el.getAttribute("aria-label") || "").catch(() => "")).trim();
+    if (label && DESTRUCTIVE_LABEL.test(label)) {
+        if (!options.confirmDestructive) {
+            return { ok: false, detail: `Refused: ref @${ref.replace(/^@/, "")} resolves to "${label}" — a destructive control. Pass confirm_destructive=true + giving_up_on_criterion if truly aborting.` };
+        }
+        if (!options.givingUpOnCriterion || options.givingUpOnCriterion.trim().length < 8) {
+            return { ok: false, detail: `Refused: confirm_destructive=true on a destructive control requires giving_up_on_criterion="<the success criterion you're abandoning>".` };
+        }
+    }
+    try {
+        await loc.click({ timeout: 4000 });
+        return { ok: true, detail: `Clicked @${ref.replace(/^@/, "")} ("${label || "?"}").` };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/intercepts pointer events/i.test(msg)) {
+            await page.keyboard.press("Escape").catch(() => undefined);
+            await page.waitForTimeout(300);
+            try {
+                await loc.click({ timeout: 3000 });
+                return { ok: true, detail: `Clicked @${ref.replace(/^@/, "")} after Escape.` };
+            }
+            catch {
+                return { ok: false, detail: `Click @${ref.replace(/^@/, "")} intercepted by overlay. Try press_key("Escape") first.` };
+            }
+        }
+        return { ok: false, detail: `Click @${ref.replace(/^@/, "")} failed: ${msg.slice(0, 200)}` };
+    }
+}
+async function fillByRef(page, ref, value) {
+    const selector = `[data-mint-ref="${ref.replace(/^@/, "")}"]`;
+    const loc = page.locator(selector).first();
+    const count = await loc.count().catch(() => 0);
+    if (count === 0) {
+        return { ok: false, detail: `Ref @${ref.replace(/^@/, "")} not found. Peek again to refresh refs.` };
+    }
+    try {
+        await loc.fill(value, { timeout: 3000 });
+        return { ok: true, detail: `Filled @${ref.replace(/^@/, "")} with "${value.slice(0, 40)}${value.length > 40 ? "…" : ""}".` };
+    }
+    catch (err) {
+        return { ok: false, detail: `Fill @${ref.replace(/^@/, "")} failed: ${err instanceof Error ? err.message.slice(0, 200) : ""}` };
+    }
+}
 async function fillByLabel(page, field, value) {
     const safe = field.replace(/"/g, '\\"');
     const selectors = [
@@ -43253,17 +43364,33 @@ async function runAgentReplay(input) {
                 steps.push(resultText);
             }
             else if (entry.tool === "click") {
-                // Replay path: trust the recorded trace. If the original run included
-                // a destructive click, it was either intentional or replay is going
-                // to drift anyway — let it through.
-                const out = await clickByLabel(page, String(inp.label ?? ""), inp.kind ?? "any", { confirmDestructive: true });
+                // Replay path: trust the recorded trace. Prefer label (stable across
+                // runs) over ref (numbering depends on current DOM). Ref-only
+                // recordings will likely drift → handled by the fallback flow.
+                const label = String(inp.label ?? "");
+                const ref = String(inp.ref ?? "").trim();
+                const out = label
+                    ? await clickByLabel(page, label, inp.kind ?? "any", {
+                        confirmDestructive: true,
+                        givingUpOnCriterion: "replay"
+                    })
+                    : ref
+                        ? await clickByRef(page, ref, { confirmDestructive: true, givingUpOnCriterion: "replay" })
+                        : { ok: false, detail: "Replay click missing both ref and label." };
                 ok = out.ok;
                 resultText = out.detail;
                 if (ok)
                     steps.push(resultText);
             }
             else if (entry.tool === "fill") {
-                const out = await fillByLabel(page, String(inp.field ?? ""), String(inp.value ?? ""));
+                const field = String(inp.field ?? "");
+                const ref = String(inp.ref ?? "").trim();
+                const value = String(inp.value ?? "");
+                const out = field
+                    ? await fillByLabel(page, field, value)
+                    : ref
+                        ? await fillByRef(page, ref, value)
+                        : { ok: false, detail: "Replay fill missing both ref and field." };
                 ok = out.ok;
                 resultText = out.detail;
                 if (ok)
@@ -43401,19 +43528,20 @@ async function runAgent(input) {
                             resultText += `\n⚠️ Already on this URL — page didn't change. Don't navigate here again; pick a different next step (click into nav, fill a form, etc.).`;
                         }
                     }
-                    else if (name === "peek") {
+                    else if (name === "peek" || name === "peek_visual") {
                         const snap = await snapshotPage(page);
                         const baseText = formatSnapshot(snap);
-                        // Multimodal: include a screenshot so the LLM can SEE visual state
-                        // (selected cards have a colored ring, pending generations have a
-                        // spinner, success ticks, etc.) that DOM text scraping misses.
-                        const png = await page.screenshot({ fullPage: false, type: "png" }).catch(() => null);
+                        const isVisual = name === "peek_visual";
+                        // Text-only peek is the default; peek_visual adds a screenshot only
+                        // when the agent explicitly opts in (much cheaper context-wise).
+                        const png = isVisual
+                            ? await page.screenshot({ fullPage: false, type: "png" }).catch(() => null)
+                            : null;
                         const visualHint = png
-                            ? `\n\nVISUAL CHECK (read the screenshot, don't just read the text above):
-- Are any items already SELECTED (colored border, check mark, "Selected (N of M)" counter)? If so, do NOT click them again.
-- Is anything LOADING (spinner, "Generating…", skeleton placeholder)? If so, wait or peek again rather than acting.
-- Is there a success indicator visible (green check, "Saved", "Created")? That probably means a previous action already succeeded.
-- Compare this screenshot to the previous one mentally. What changed? What stayed the same? Use that to decide your next action.`
+                            ? `\n\nVISUAL CHECK (read the screenshot — that's why you called peek_visual):
+- Selected items have colored borders / check marks. Don't re-click them.
+- Spinners / "Generating…" mean wait, not act.
+- Compare to the previous screenshot — what changed?`
                             : "";
                         resultText = baseText + visualHint;
                         trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 400) });
@@ -43425,28 +43553,40 @@ async function runAgent(input) {
                                     { type: "text", text: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText },
                                     { type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }
                                 ]
-                                : resultText
+                                : (resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText)
                         });
                         continue;
                     }
                     else if (name === "click") {
+                        const ref = String(inp.ref ?? "").trim();
                         const label = String(inp.label ?? "");
-                        // HARD-REFUSE: if the previous click was on this same label,
-                        // it's almost certainly a loop. The LLM should peek + pick
-                        // a different target. No opt-out — even confirm_destructive
-                        // can't bypass this, the agent must change strategy.
+                        // Identity key for repeat-click detection. Prefer ref if given.
+                        const key = ref ? `ref:${ref.replace(/^@/, "")}` : `label:${label.toLowerCase()}`;
                         const lastClick = [...trace].reverse().find((t) => t.tool === "click");
-                        if (lastClick && String((lastClick.input ?? {}).label ?? "").toLowerCase() === label.toLowerCase()) {
-                            const refusal = `Refused: you just clicked "${label}" on the previous turn. Repeating the same click never helps — either the action already succeeded (so peek to verify and move on) OR the label matched the wrong element (so peek and try a different label). Pick a DIFFERENT next action.`;
+                        const lastKey = lastClick
+                            ? (lastClick.input?.ref
+                                ? `ref:${String(lastClick.input.ref).replace(/^@/, "")}`
+                                : `label:${String(lastClick.input?.label ?? "").toLowerCase()}`)
+                            : "";
+                        if (lastKey && lastKey === key) {
                             ok = false;
-                            resultText = refusal;
+                            resultText = `Refused: you just clicked the same target on the previous turn (${key}). Repeating never helps — peek to verify the page changed and pick a DIFFERENT action.`;
+                        }
+                        else if (!ref && !label) {
+                            ok = false;
+                            resultText = `Refused: click requires either ref or label. Pass ref="e1" (from your last peek) for deterministic targeting.`;
                         }
                         else {
                             const before = await pageStateHash(page);
-                            const out = await clickByLabel(page, label, inp.kind ?? "any", {
-                                confirmDestructive: inp.confirm_destructive === true,
-                                givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
-                            });
+                            const out = ref
+                                ? await clickByRef(page, ref, {
+                                    confirmDestructive: inp.confirm_destructive === true,
+                                    givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
+                                })
+                                : await clickByLabel(page, label, inp.kind ?? "any", {
+                                    confirmDestructive: inp.confirm_destructive === true,
+                                    givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
+                                });
                             ok = out.ok;
                             resultText = out.detail;
                             if (out.ok) {
@@ -43456,24 +43596,33 @@ async function runAgent(input) {
                                 await input.onScreenshot?.(steps.length);
                                 const after = await pageStateHash(page);
                                 if (stateUnchanged(before, after)) {
-                                    resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state OR the click hit a non-interactive node. DO NOT click the same label again — peek and pick a different action.`;
+                                    resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state. DO NOT click the same target again — peek and pick a different action.`;
                                     ok = false;
                                 }
                             }
                         }
                     }
                     else if (name === "fill") {
-                        const before = await pageStateHash(page);
-                        const out = await fillByLabel(page, String(inp.field ?? ""), String(inp.value ?? ""));
-                        ok = out.ok;
-                        resultText = out.detail;
-                        if (out.ok) {
-                            steps.push(out.detail);
-                            await captureScreenshot(page, runDir, steps.length);
-                            await input.onScreenshot?.(steps.length);
-                            const after = await pageStateHash(page);
-                            if (stateUnchanged(before, after)) {
-                                resultText += `\n⚠️ No observable effect: page unchanged after fill. The input may already hold this value, or fill targeted the wrong field. Don't repeat — peek and verify.`;
+                        const ref = String(inp.ref ?? "").trim();
+                        const field = String(inp.field ?? "");
+                        const value = String(inp.value ?? "");
+                        if (!ref && !field) {
+                            ok = false;
+                            resultText = `Refused: fill requires either ref or field.`;
+                        }
+                        else {
+                            const before = await pageStateHash(page);
+                            const out = ref ? await fillByRef(page, ref, value) : await fillByLabel(page, field, value);
+                            ok = out.ok;
+                            resultText = out.detail;
+                            if (out.ok) {
+                                steps.push(out.detail);
+                                await captureScreenshot(page, runDir, steps.length);
+                                await input.onScreenshot?.(steps.length);
+                                const after = await pageStateHash(page);
+                                if (stateUnchanged(before, after)) {
+                                    resultText += `\n⚠️ No observable effect: page unchanged after fill. Input may already hold this value.`;
+                                }
                             }
                         }
                     }
