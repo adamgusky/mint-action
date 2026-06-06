@@ -42833,6 +42833,18 @@ const AGENT_TOOLS = [
         }
     },
     {
+        name: "count_check",
+        description: "Count how many DOM elements contain a piece of text and assert the count meets a minimum. Use this for quantity criteria like 'at least N rows' or 'N items appear in the table'. Returns the actual count. If the count meets/exceeds minCount AND a success criterion mentions a number ≤ that count plus matching keywords, the criterion is auto-marked DONE.",
+        input_schema: {
+            type: "object",
+            properties: {
+                text: { type: "string", description: "Substring shared by each row/item you're counting (e.g., 'Planned', a date format, a column class name visible in text)." },
+                minCount: { type: "number", description: "Minimum required count. The assertion passes when actual >= this." }
+            },
+            required: ["text", "minCount"]
+        }
+    },
+    {
         name: "complete",
         description: "Signal the test is over. Use 'passed' only if every success criterion is verifiably satisfied. Use 'failed' if you're confident the feature is broken (cite the evidence). Use 'blocked' if you couldn't proceed (e.g., env issue, auth wall, missing fixture).",
         input_schema: {
@@ -42885,6 +42897,8 @@ OPERATING PRINCIPLES
 - Disabled controls = app waiting on a required input. Fill the visible empty inputs first.
 - Modal overlays intercept clicks. Interact with controls INSIDE the modal first.
 - After completing each success criterion, verify it with assert_visible — marks it [✓ DONE] in your tracker.
+- For NEGATIVE criteria ("X is no longer visible", "X is gone", "X is closed"), call assert_visible against the SUBJECT (e.g., the modal heading) — a TIMEOUT counts as proof of absence and marks the criterion DONE.
+- For QUANTITY criteria ("at least N rows visible", "N items appear"), use count_check(text, minCount). The text should be a substring shared by every row/item (a column label visible per row, a date pattern, a status tag). When count ≥ N AND text overlaps the criterion noun, the criterion is auto-marked DONE.
 
 EFFICIENCY
 - Don't peek twice in a row without acting.
@@ -43655,19 +43669,68 @@ async function runAgent(input) {
                         steps.push(found ? `Asserted "${text}" is visible.` : `Could not verify "${text}".`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
-                        // Update the progress tracker: a success criterion is "done" when
-                        // any of its keywords show up via assert_visible. Substring match
-                        // both ways so the agent can assert specific text that's part of
-                        // the criterion (or assert the whole criterion verbatim).
-                        if (found) {
+                        // Update the progress tracker. Two ways an assert_visible can
+                        // satisfy a criterion:
+                        //  (a) POSITIVE: the asserted text appeared, and overlaps with
+                        //      the criterion text (substring either direction).
+                        //  (b) NEGATIVE: the criterion describes absence ("X is no longer
+                        //      visible", "X is gone", "X disappeared", "X was removed",
+                        //      "X is closed"). In that case, an assert_visible that
+                        //      TIMED OUT on the negated subject counts as confirmation
+                        //      that the absence holds — the agent has affirmatively
+                        //      verified the state.
+                        const tLower = text.toLowerCase();
+                        const NEGATION_RE = /(no longer (visible|present|shown)|is gone|is hidden|isn'?t visible|is not visible|disappear(ed|s)|was removed|is removed|is closed|is dismissed|has closed)/i;
+                        for (const crit of input.successCriteria) {
+                            if (passedCriteria.has(crit))
+                                continue;
+                            const cLower = crit.toLowerCase();
+                            const positiveMatch = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 30));
+                            const isNegativeCrit = NEGATION_RE.test(crit);
+                            const negativeMatch = !found && isNegativeCrit && cLower.includes(tLower);
+                            if ((found && positiveMatch) || negativeMatch) {
+                                passedCriteria.add(crit);
+                                resultText += `\n✓ Marked success criterion as DONE: "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                            }
+                        }
+                        // If this assert produced a not-found AND no negative criterion
+                        // matched it, surface a hint so the agent doesn't keep guessing.
+                        if (!found) {
+                            const negCrits = input.successCriteria.filter((c) => NEGATION_RE.test(c) && !passedCriteria.has(c));
+                            if (negCrits.length > 0) {
+                                resultText += `\n💡 Tip: a not-found assertion can satisfy a NEGATIVE criterion (one containing "no longer visible", "is gone", etc.) — but only if its text overlaps with the criterion's subject. Pending negative criteria: ${negCrits.map((c) => `"${c.slice(0, 60)}…"`).join("; ")}.`;
+                            }
+                        }
+                    }
+                    else if (name === "count_check") {
+                        const text = String(inp.text ?? "");
+                        const minCount = Number(inp.minCount ?? 1);
+                        // Count distinct elements containing the text. Use getByText
+                        // (substring) and snap to .count().
+                        const count = await page.getByText(text, { exact: false }).count().catch(() => 0);
+                        ok = count >= minCount;
+                        resultText = ok
+                            ? `Found ${count} element(s) containing "${text}" (≥ ${minCount} required).`
+                            : `Found only ${count} element(s) containing "${text}" (< ${minCount} required).`;
+                        steps.push(ok ? `Counted ${count} of "${text}" (≥${minCount}).` : `Insufficient "${text}" count (${count}/${minCount}).`);
+                        await captureScreenshot(page, runDir, steps.length);
+                        await input.onScreenshot?.(steps.length);
+                        // Quantity matcher: a criterion like "At least 3 X are visible"
+                        // is DONE when count >= the number in the criterion AND the
+                        // searched text overlaps with the criterion's noun.
+                        if (ok) {
                             const tLower = text.toLowerCase();
                             for (const crit of input.successCriteria) {
                                 if (passedCriteria.has(crit))
                                     continue;
                                 const cLower = crit.toLowerCase();
-                                if (cLower.includes(tLower) || tLower.includes(cLower.slice(0, 30))) {
+                                // Pull the first integer mentioned in the criterion.
+                                const numMatch = cLower.match(/(?:at least\s+|≥\s*|>=\s*)?(\d+)/);
+                                const required = numMatch ? Number(numMatch[1]) : null;
+                                const textOverlap = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 20));
+                                if (required !== null && count >= required && textOverlap) {
                                     passedCriteria.add(crit);
-                                    resultText += `\n✓ Marked success criterion as DONE: "${crit.slice(0, 80)}…"`;
+                                    resultText += `\n✓ Marked success criterion as DONE (count ${count} ≥ ${required}): "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
                                 }
                             }
                         }
