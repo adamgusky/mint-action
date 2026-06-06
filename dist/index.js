@@ -41738,6 +41738,32 @@ function smartTruncate(value, max) {
  * preserve these quantities verbatim in its criteria, and the comment
  * renderer compares them against observed counts.
  */
+/**
+ * Generate synthetic success criteria from user-stated quantities that
+ * aren't already covered by the existing criteria. Each cardinal in the
+ * user's prompt becomes an "At least N <subject>" criterion the agent
+ * must verify via count_check before complete(passed) can succeed.
+ *
+ * We use "at least" rather than "exactly" because most flows produce ≥N
+ * rather than exactly N (the comment renderer's divergence table is what
+ * surfaces the user-asked-vs-app-delivered gap). This keeps the test
+ * passable when the app over-delivers, while still forcing measurement.
+ */
+function synthesizeQuantityCriteria(quantities, existingCriteria) {
+    const existingLower = existingCriteria.map((c) => c.toLowerCase());
+    const out = [];
+    for (const q of quantities) {
+        const subj = q.subject.replace(/\s+(appear|appears|are visible|is visible|shown|displayed|listed)$/i, "").trim();
+        // Skip if an existing criterion already mentions BOTH the number AND
+        // a leading word of the subject — avoid duplication.
+        const subjHead = subj.split(/\s+/).slice(0, 2).join(" ").toLowerCase();
+        const dupe = existingLower.some((c) => c.includes(String(q.value)) && c.includes(subjHead));
+        if (dupe)
+            continue;
+        out.push(`At least ${q.value} ${subj} appear (user prompt mentioned "${q.raw}")`);
+    }
+    return out;
+}
 function extractUserStatedQuantities(prompt) {
     if (!prompt)
         return [];
@@ -41864,8 +41890,13 @@ async function generateAgentBriefFromIntent(input) {
     let brief = parsed.brief;
     if (brief) {
         const userStatedQuantities = extractUserStatedQuantities(input.testIntent);
+        // If the LLM dropped a cardinal from the criteria, synthesize one.
+        // This is the deterministic safety net for K4 — the brief will ALWAYS
+        // carry a criterion for each user-stated quantity.
+        const synthesized = synthesizeQuantityCriteria(userStatedQuantities, brief.successCriteria);
         brief = {
             ...brief,
+            successCriteria: [...brief.successCriteria, ...synthesized],
             userPrompt: input.testIntent,
             userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined
         };
@@ -42966,9 +42997,9 @@ If your recent actions look repetitive (same tool + same input twice in a row), 
         ? `\nUSER'S LITERAL PROMPT (from the @mint comment — your ground truth):\n"""${input.userPrompt}"""\n`
         : "";
     const quantityBlock = input.userStatedQuantities?.length
-        ? `\nUSER-STATED QUANTITIES (cardinal numbers from the prompt — verify these literal counts; if reality diverges, you still PASS but you MUST flag the divergence in your complete summary, e.g., "User asked for 3, observed 60"):
+        ? `\nUSER-STATED QUANTITIES (cardinal numbers from the prompt — these are MANDATORY to measure with count_check before you can call complete(passed)):
 ${input.userStatedQuantities.map((q) => `  - ${q.value} ${q.subject} (from "${q.raw}")`).join("\n")}
-\nFor each quantity, use count_check(text=<row-specific substring>, minCount=<user's number>) to measure. If the app's actual count differs substantially from the user's number, that is a FINDING — describe it in your complete summary so the developer can decide if it's a bug or expected.\n`
+\nFOR EACH ONE you MUST call count_check(text=<row-specific substring of the subject>, minCount=${input.userStatedQuantities[0].value}) — measuring the actual count. The hard gate REFUSES complete(passed) until each quantity has been measured. Pick a text substring shared by every ROW (status badge value, per-row keyword, date format, action button per row), NOT a header/tab/title which is UI chrome. The row-scoped count is what matters.\n\nWhen reality diverges from the user's number, you still PASS (criteria say "at least N") but you MUST mention the divergence verbatim in your complete summary: "User asked for ${input.userStatedQuantities[0].value}, observed N — likely <expected app behavior | possible bug>".\n`
         : "";
     return `You are Mint, an in-browser test agent. You drive a real Playwright-controlled browser through user flows in the application under test.
 
@@ -43897,8 +43928,28 @@ async function runAgent(input) {
                                     attestNotes.push(`Rejected criterion ${e?.criterion_index}: observation_quote "${quote.slice(0, 60)}…" NOT found in last 3 tool results. Quote verbatim text from a peek/assert you actually ran.`);
                                 }
                             }
+                            // Extra hard gate: if userStatedQuantities exist, EACH must
+                            // have been measured via count_check. We check by looking for
+                            // any observation whose `text` overlaps with the quantity's
+                            // subject. Without this, the agent can claim "criteria met"
+                            // and skip the actual measurement — losing the divergence
+                            // signal users need.
+                            const quantitiesPendingMeasurement = [];
+                            for (const q of input.userStatedQuantities ?? []) {
+                                const subjLower = q.subject.toLowerCase();
+                                const measured = quantitativeObservations.some((o) => {
+                                    const tLower = o.text.toLowerCase();
+                                    return subjLower.includes(tLower) || tLower.includes(subjLower.split(/\s+/)[0] ?? "");
+                                });
+                                if (!measured)
+                                    quantitiesPendingMeasurement.push({ value: q.value, subject: q.subject });
+                            }
                             const pending = input.successCriteria.filter((c) => !passedCriteria.has(c));
-                            if (pending.length > 0) {
+                            if (pending.length === 0 && quantitiesPendingMeasurement.length > 0) {
+                                ok = false;
+                                resultText = `Refused complete(passed): all criteria checked, but ${quantitiesPendingMeasurement.length} user-stated quantity/quantities haven't been measured with count_check yet. The PR comment needs these numbers to surface intent vs reality divergence.\n\nUnmeasured:\n${quantitiesPendingMeasurement.map((q, i) => `  ${i + 1}. ${q.value} ${q.subject}`).join("\n")}\n\nCall count_check(text=<row-substring of the subject>, minCount=<user's number>) for each, then retry complete(passed).`;
+                            }
+                            else if (pending.length > 0) {
                                 ok = false;
                                 const pendingIdxList = input.successCriteria
                                     .map((c, i) => ({ c, i }))
