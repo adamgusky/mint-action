@@ -37,6 +37,15 @@ export interface CompleteInput {
         ok: boolean;
         result: string;
     }>;
+    /** count_check observations from the agent. The comment renderer compares
+     *  these against the brief's userStatedQuantities to surface intent vs
+     *  reality divergence. */
+    quantitativeObservations?: Array<{
+        text: string;
+        rowScopeCount: number;
+        pageScopeCount: number;
+        atStep: number;
+    }>;
 }
 export declare class MintApi {
     private base;

@@ -41724,6 +41724,54 @@ function smartTruncate(value, max) {
 
 
 /**
+ * Extract cardinal numbers + the noun they modify from the developer's
+ * @mint prompt. "see 3 newly scheduled article rows on the dashboard" →
+ * [{ value: 3, subject: "newly scheduled article rows", raw: "3 newly scheduled article rows" }].
+ *
+ * Skips:
+ *   - numbers inside dates/times ("June 6 2026", "10:30am")
+ *   - version numbers ("v1.2", "Next.js 16")
+ *   - bare digits with no following noun ("test 1", "step 5") — those are
+ *     usually ordinals, not user-stated quantities
+ *
+ * This is a regex pass — deterministic, no LLM. The brief generator must
+ * preserve these quantities verbatim in its criteria, and the comment
+ * renderer compares them against observed counts.
+ */
+function extractUserStatedQuantities(prompt) {
+    if (!prompt)
+        return [];
+    const out = [];
+    // Match: digit(s) followed by 1-5 lowercase words. Reject if the word is a
+    // unit-of-time/units that wouldn't be a UI quantity (sec, min, hr, ms, px,
+    // etc.) or if surrounded by date-like context.
+    const numAndNoun = /\b(\d{1,4})\s+([a-z][a-z\-]*(?:\s+[a-z][a-z\-]*){0,4})\b/gi;
+    const UNIT_BLOCKLIST = /^(seconds?|sec|s|minutes?|min|hours?|hrs?|h|days?|d|months?|mo|years?|y|ms|milliseconds?|px|pixels?|am|pm|of|to|am|pm|hz|fps|kb|mb|gb|tb)\b/i;
+    const DATE_RE = /\b(20\d{2}|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i;
+    const VERSION_RE = /\b(v\d|version\s+\d|next\.?js|react|node)\s*[\d.]/i;
+    let m;
+    while ((m = numAndNoun.exec(prompt)) !== null) {
+        const value = Number(m[1]);
+        const subject = m[2].trim();
+        const raw = m[0];
+        if (!Number.isFinite(value) || value <= 0 || value > 100_000)
+            continue;
+        if (UNIT_BLOCKLIST.test(subject))
+            continue;
+        // Look at a small window around the match for date/version context.
+        const ctxStart = Math.max(0, m.index - 12);
+        const ctxEnd = Math.min(prompt.length, m.index + raw.length + 12);
+        const ctx = prompt.slice(ctxStart, ctxEnd);
+        if (DATE_RE.test(ctx) || VERSION_RE.test(ctx))
+            continue;
+        // Avoid duplicates of the same value+subject.
+        if (out.some((q) => q.value === value && q.subject.toLowerCase() === subject.toLowerCase()))
+            continue;
+        out.push({ value, subject, raw });
+    }
+    return out;
+}
+/**
  * Generate a high-level brief for the tool-using agent. The brief describes
  * the GOAL and what success looks like — it does NOT pre-decide concrete
  * steps. The agent decides moves at runtime by looking at the live page.
@@ -41755,6 +41803,12 @@ The brief has four pieces:
    - Bad: "A planning indicator appears after clicking Submit" — when the user asked for "the new entry appears in the History table"
    - Good: "The new entry appears in the History table after submit"
 
+   **LOCK USER-STATED CARDINAL NUMBERS.** If the developer wrote a literal number ("3 articles", "5 rows", "2 keywords"), that number MUST appear unchanged in the criterion. Do NOT relax "3" to "at least 3" or ">=3" or "some". The number is the user's explicit ask; if reality diverges, that's a finding for them — not a license for you to loosen the bar. If the app's behavior makes the literal number unachievable in practice (e.g., the app schedules a fixed batch per submit regardless of input), STILL use the user's literal number in the criterion AND add a hint flagging the divergence. Examples:
+   - User: "see 3 article rows appear" → criterion: "3 newly scheduled article rows appear in the dashboard list" (NOT "at least 3", NOT "3 or more")
+   - User: "exactly 5 results" → criterion: "exactly 5 results visible"
+   - User: "at least 2" → criterion may use "at least 2" (user explicitly relaxed)
+   - User: "a few articles" (no number) → criterion may use "≥1" or similar (no number to preserve)
+
 4. **hints** (array of 0-5 short strings, optional): Non-prescriptive nuggets from your code reading that help the agent. Use these for non-obvious facts about the UI — never use them to write step-by-step instructions. Good hint: "The image playground lives inside the Image tab of Settings — it's not at /settings/images." Bad hint: "Click the Image tab, then expand the panel, then fill the prompt."
 
 5. **persona**: Pick the mint.yml persona id whose plan/data unlocks this flow.
@@ -41780,7 +41834,16 @@ const briefSchema = objectType({
     entryUrl: stringType().min(1),
     successCriteria: arrayType(stringType().min(2)).min(1).max(8),
     hints: arrayType(stringType()).default([]),
-    persona: stringType().min(1)
+    persona: stringType().min(1),
+    // userPrompt + userStatedQuantities are post-processed after the LLM
+    // returns; we tolerate them in the schema in case the LLM volunteers them
+    // but the canonical source is the regex extractor below.
+    userPrompt: stringType().optional(),
+    userStatedQuantities: arrayType(objectType({
+        value: numberType(),
+        subject: stringType(),
+        raw: stringType()
+    })).optional()
 });
 const generate_agent_brief_responseSchema = objectType({
     brief: briefSchema.nullable(),
@@ -41795,8 +41858,20 @@ async function generateAgentBriefFromIntent(input) {
         maxTokens: 4_000
     });
     const parsed = generate_agent_brief_responseSchema.parse(parseLlmJson(llmResult.text));
+    // Attach the user prompt + extracted cardinals to the brief so downstream
+    // layers (agent loop, comment renderer) can detect intent vs reality
+    // divergence even if the LLM dropped a number from the criteria.
+    let brief = parsed.brief;
+    if (brief) {
+        const userStatedQuantities = extractUserStatedQuantities(input.testIntent);
+        brief = {
+            ...brief,
+            userPrompt: input.testIntent,
+            userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined
+        };
+    }
     return {
-        brief: parsed.brief,
+        brief,
         reason: parsed.reason,
         inputTokens: llmResult.inputTokens,
         outputTokens: llmResult.outputTokens
@@ -42834,11 +42909,11 @@ const AGENT_TOOLS = [
     },
     {
         name: "count_check",
-        description: "Count how many DOM elements contain a piece of text and assert the count meets a minimum. Use this for quantity criteria like 'at least N rows' or 'N items appear in the table'. Returns the actual count. If the count meets/exceeds minCount AND a success criterion mentions a number ≤ that count plus matching keywords, the criterion is auto-marked DONE.",
+        description: "Count how many ROW-LIKE elements (tr, [role=row], li, [role=listitem]) contain a piece of text and assert the count meets a minimum. Use this for quantity criteria like 'at least N rows' or 'N items appear in the table'. The row scope avoids false positives where the text appears in UI chrome (headers, tabs, titles). Returns both row-scoped and page-scoped counts so divergences are visible. If row-scoped count is 0, falls back to page count but flags it. Auto-marks any 'N <text>' / 'at least N <text>' / 'exactly N <text>' criterion when the row count satisfies.",
         input_schema: {
             type: "object",
             properties: {
-                text: { type: "string", description: "Substring shared by each row/item you're counting (e.g., 'Planned', a date format, a column class name visible in text)." },
+                text: { type: "string", description: "Substring shared by each row/item you're counting. Pick something stable PER ROW (a status badge, a date column value, a per-row keyword) — NOT a header label which appears once." },
                 minCount: { type: "number", description: "Minimum required count. The assertion passes when actual >= this." }
             },
             required: ["text", "minCount"]
@@ -42887,12 +42962,20 @@ ${progress.recentTools.map((t, i) => {
 If your recent actions look repetitive (same tool + same input twice in a row), CHANGE STRATEGY. Repeating a click on an already-selected item, or peeking twice without acting, is wasted budget. Pick a different forward action.
 `
         : "";
+    const userPromptBlock = input.userPrompt
+        ? `\nUSER'S LITERAL PROMPT (from the @mint comment — your ground truth):\n"""${input.userPrompt}"""\n`
+        : "";
+    const quantityBlock = input.userStatedQuantities?.length
+        ? `\nUSER-STATED QUANTITIES (cardinal numbers from the prompt — verify these literal counts; if reality diverges, you still PASS but you MUST flag the divergence in your complete summary, e.g., "User asked for 3, observed 60"):
+${input.userStatedQuantities.map((q) => `  - ${q.value} ${q.subject} (from "${q.raw}")`).join("\n")}
+\nFor each quantity, use count_check(text=<row-specific substring>, minCount=<user's number>) to measure. If the app's actual count differs substantially from the user's number, that is a FINDING — describe it in your complete summary so the developer can decide if it's a bug or expected.\n`
+        : "";
     return `You are Mint, an in-browser test agent. You drive a real Playwright-controlled browser through user flows in the application under test.
 
 GOAL: ${input.goal}
 
 ENTRY: ${input.entryUrl}
-
+${userPromptBlock}${quantityBlock}
 SUCCESS CRITERIA (every one must be verifiably satisfied before you call complete with status="passed"):
 ${criteriaWithStatus}
 
@@ -43494,6 +43577,7 @@ async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
     const maxTurns = input.maxTurns ?? 60;
     const trace = [];
+    const quantitativeObservations = [];
     // Land on the entry page before the agent's first turn — saves one tool call.
     try {
         await page.goto(agent_loop_absoluteUrl(baseUrl, input.entryUrl), { waitUntil: "domcontentloaded", timeout: 30_000 });
@@ -43717,32 +43801,56 @@ async function runAgent(input) {
                     else if (name === "count_check") {
                         const text = String(inp.text ?? "");
                         const minCount = Number(inp.minCount ?? 1);
-                        // Count distinct elements containing the text. Use getByText
-                        // (substring) and snap to .count().
-                        const count = await page.getByText(text, { exact: false }).count().catch(() => 0);
-                        ok = count >= minCount;
+                        // ROW-SCOPED count: only count row-like elements (table rows, list
+                        // items, role=row, role=listitem) that contain the text. This
+                        // avoids false positives where the text appears in UI chrome
+                        // (headers, tabs, titles, subtitle counts). Page-scoped count is
+                        // kept as a fallback diagnostic.
+                        const rowSelector = 'tr, [role="row"], li, [role="listitem"]';
+                        const rowScopeCount = await page
+                            .locator(rowSelector)
+                            .filter({ hasText: text })
+                            .count()
+                            .catch(() => 0);
+                        const pageScopeCount = await page.getByText(text, { exact: false }).count().catch(() => 0);
+                        const usedCount = rowScopeCount > 0 ? rowScopeCount : pageScopeCount;
+                        const scopeNote = rowScopeCount > 0
+                            ? `row-scoped`
+                            : pageScopeCount > 0
+                                ? `page-scoped (no row-like ancestors matched — likely chrome: header/tab/title)`
+                                : `none`;
+                        ok = usedCount >= minCount;
                         resultText = ok
-                            ? `Found ${count} element(s) containing "${text}" (≥ ${minCount} required).`
-                            : `Found only ${count} element(s) containing "${text}" (< ${minCount} required).`;
-                        steps.push(ok ? `Counted ${count} of "${text}" (≥${minCount}).` : `Insufficient "${text}" count (${count}/${minCount}).`);
+                            ? `Found ${usedCount} element(s) containing "${text}" (≥ ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`
+                            : `Found only ${usedCount} element(s) containing "${text}" (< ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`;
+                        steps.push(ok ? `Counted ${usedCount} of "${text}" (≥${minCount}, ${scopeNote}).` : `Insufficient "${text}" count (${usedCount}/${minCount}).`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
-                        // Quantity matcher: a criterion like "At least 3 X are visible"
-                        // is DONE when count >= the number in the criterion AND the
-                        // searched text overlaps with the criterion's noun.
+                        // Record observation for the comment renderer to compare against
+                        // the user's stated quantities.
+                        quantitativeObservations.push({
+                            text,
+                            rowScopeCount,
+                            pageScopeCount,
+                            atStep: steps.length
+                        });
+                        // Quantity matcher: a criterion like "3 X are visible" or "exactly
+                        // 3 X" or "at least 3 X" is DONE when count >= the number in the
+                        // criterion AND the searched text overlaps with the criterion's
+                        // noun. Uses row-scoped count for matching to avoid chrome
+                        // false positives.
                         if (ok) {
                             const tLower = text.toLowerCase();
                             for (const crit of input.successCriteria) {
                                 if (passedCriteria.has(crit))
                                     continue;
                                 const cLower = crit.toLowerCase();
-                                // Pull the first integer mentioned in the criterion.
-                                const numMatch = cLower.match(/(?:at least\s+|≥\s*|>=\s*)?(\d+)/);
+                                const numMatch = cLower.match(/(?:at least\s+|exactly\s+|≥\s*|>=\s*)?(\d+)/);
                                 const required = numMatch ? Number(numMatch[1]) : null;
                                 const textOverlap = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 20));
-                                if (required !== null && count >= required && textOverlap) {
+                                if (required !== null && usedCount >= required && textOverlap) {
                                     passedCriteria.add(crit);
-                                    resultText += `\n✓ Marked success criterion as DONE (count ${count} ≥ ${required}): "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                                    resultText += `\n✓ Marked success criterion as DONE (count ${usedCount} ≥ ${required}): "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
                                 }
                             }
                         }
@@ -43801,13 +43909,13 @@ async function runAgent(input) {
                                 resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending (1-based index):\n${pendingIdxList}${attestBlock}\n\nOptions:\n  1) Continue the flow + assert_visible against the criterion's literal END state.\n  2) If a criterion is genuinely satisfied but the matcher's substring rule missed it, retry complete(passed) with criteria_evidence=[{criterion_index: N, observation_quote: "<15+ char verbatim text from your most recent peek or assert>"}] — be SPECIFIC.\n  3) If you cannot reach the end state, call complete(status="blocked", summary=...) or complete(status="failed", summary=...).`;
                             }
                             else {
-                                verdict = { status, summary, toolCalls, turns, trace };
+                                verdict = { status, summary, toolCalls, turns, trace, quantitativeObservations };
                                 const attestBlock = attestNotes.length ? ` (${attestNotes.length} attestation(s))` : "";
                                 resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified)${attestBlock}.`;
                             }
                         }
                         else {
-                            verdict = { status, summary, toolCalls, turns, trace };
+                            verdict = { status, summary, toolCalls, turns, trace, quantitativeObservations };
                             resultText = `Run marked ${status}.`;
                         }
                     }
@@ -43838,7 +43946,8 @@ async function runAgent(input) {
                 summary: "Agent ended the turn without calling complete. Likely confused; check the trace.",
                 toolCalls,
                 turns,
-                trace
+                trace,
+                quantitativeObservations
             };
             break;
         }
@@ -43851,7 +43960,8 @@ async function runAgent(input) {
         summary: `Hit max turns (${maxTurns}) without complete. Last tools: ${trace.slice(-3).map((t) => t.tool).join(", ")}`,
         toolCalls,
         turns,
-        trace
+        trace,
+        quantitativeObservations
     };
 }
 
@@ -43922,7 +44032,9 @@ async function runAgentReplayMission(options, runDir, steps, evidence, artifacts
                     `A previous recording for this intent existed but drifted; the steps that worked last time were: ${replay.trace.filter((t) => t.tool !== "peek" && t.tool !== "complete").map((t) => `${t.tool}(${JSON.stringify(t.input).slice(0, 80)})`).join(" → ")}`
                 ],
                 agent: options.agent,
-                steps
+                steps,
+                userPrompt: replay.brief.userPrompt,
+                userStatedQuantities: replay.brief.userStatedQuantities
             });
         }
         await pauseForVideo(page, options.config, "final");
@@ -43956,6 +44068,9 @@ async function runAgentReplayMission(options, runDir, steps, evidence, artifacts
         };
         await writeReport(runDir, testResult);
         await dist_writeJson(external_node_path_namespaceObject.join(runDir, "agent-trace.json"), result.trace);
+        if (result.quantitativeObservations?.length) {
+            await dist_writeJson(external_node_path_namespaceObject.join(runDir, "quantitative-observations.json"), result.quantitativeObservations);
+        }
         return testResult;
     }
     catch (err) {
@@ -44021,7 +44136,9 @@ async function runAgentMission(options, runDir, steps, evidence, artifacts, cons
             successCriteria: brief.successCriteria,
             hints: brief.hints,
             agent: options.agent,
-            steps
+            steps,
+            userPrompt: brief.userPrompt,
+            userStatedQuantities: brief.userStatedQuantities
         });
         await pauseForVideo(page, options.config, "final");
         await context.close();
@@ -44053,6 +44170,9 @@ async function runAgentMission(options, runDir, steps, evidence, artifacts, cons
         };
         await writeReport(runDir, result);
         await dist_writeJson(external_node_path_namespaceObject.join(runDir, "agent-trace.json"), agentResult.trace);
+        if (agentResult.quantitativeObservations?.length) {
+            await dist_writeJson(external_node_path_namespaceObject.join(runDir, "quantitative-observations.json"), agentResult.quantitativeObservations);
+        }
         return result;
     }
     catch (err) {
@@ -47049,6 +47169,18 @@ async function run() {
             core.warning(`Failed to read agent trace: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
+    // Read quantitative observations if any count_check ran.
+    let quantitativeObservations;
+    const observationsPath = reportDir ? external_node_path_default().join(reportDir, "quantitative-observations.json") : "";
+    if (observationsPath && external_node_fs_default().existsSync(observationsPath)) {
+        try {
+            quantitativeObservations = JSON.parse(external_node_fs_default().readFileSync(observationsPath, "utf8"));
+            core.info(`Quantitative observations loaded: ${quantitativeObservations?.length ?? 0}.`);
+        }
+        catch (err) {
+            core.warning(`Failed to read quantitative observations: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
     // Post completion
     core.info("Posting completion…");
     await api.postComplete(missionId, {
@@ -47059,7 +47191,8 @@ async function run() {
         suggestedFix: result.suggestedFix,
         videoUrl,
         previewUrl,
-        agentTrace
+        agentTrace,
+        quantitativeObservations
     });
     core.info(`Result: ${result.status}`);
     if (result.status !== "passed" && result.status !== "skipped" && result.status !== "not_browser_testable") {
