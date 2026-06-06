@@ -42846,12 +42846,24 @@ const AGENT_TOOLS = [
     },
     {
         name: "complete",
-        description: "Signal the test is over. Use 'passed' only if every success criterion is verifiably satisfied. Use 'failed' if you're confident the feature is broken (cite the evidence). Use 'blocked' if you couldn't proceed (e.g., env issue, auth wall, missing fixture).",
+        description: "Signal the test is over. Use 'passed' only if every success criterion is verifiably satisfied. Use 'failed' if you're confident the feature is broken (cite the evidence). Use 'blocked' if you couldn't proceed (e.g., env issue, auth wall, missing fixture). If passed is refused because a criterion looks pending but you've actually verified it (semantic overlap the matcher missed), retry with criteria_evidence: each entry must include the criterion's index AND a verbatim quote (≥15 chars) from your most recent peek or assert result. The system validates the quote against your recorded observations.",
         input_schema: {
             type: "object",
             properties: {
                 status: { type: "string", enum: ["passed", "failed", "blocked"] },
-                summary: { type: "string", description: "One paragraph: what you did, what you saw, what makes you confident in the verdict." }
+                summary: { type: "string", description: "One paragraph: what you did, what you saw, what makes you confident in the verdict." },
+                criteria_evidence: {
+                    type: "array",
+                    description: "Optional escape valve. Provide ONE entry per pending criterion you believe is satisfied but the matcher missed. Each entry's observation_quote must appear verbatim (case-insensitive) in your last 3 peek/assert results — otherwise the entry is rejected.",
+                    items: {
+                        type: "object",
+                        properties: {
+                            criterion_index: { type: "number", description: "1-based index of the success criterion from the system prompt." },
+                            observation_quote: { type: "string", description: "A 15+ character verbatim quote from a recent peek/assert result proving the criterion is met." }
+                        },
+                        required: ["criterion_index", "observation_quote"]
+                    }
+                }
             },
             required: ["status", "summary"]
         }
@@ -43744,15 +43756,54 @@ async function runAgent(input) {
                         // the END state the user actually asked for ("3 new rows appear
                         // on the dashboard"). Refusing here forces the agent to keep
                         // going until the literal post-state is observable.
+                        //
+                        // Escape valve: criteria_evidence allows the agent to attest a
+                        // criterion the substring matcher missed (semantic overlap). Each
+                        // entry must include a verbatim ≥15-char quote that appears in
+                        // the last 3 peek/assert results. If validated, the criterion is
+                        // marked DONE.
                         if (status === "passed") {
+                            // Process criteria_evidence first.
+                            const evidence = Array.isArray(inp.criteria_evidence) ? inp.criteria_evidence : [];
+                            const recentResults = trace.slice(-3).map((t) => String(t.result ?? "")).join("\n").toLowerCase();
+                            const attestNotes = [];
+                            for (const e of evidence) {
+                                const idx = Number(e?.criterion_index ?? 0) - 1;
+                                const quote = String(e?.observation_quote ?? "").trim();
+                                if (idx < 0 || idx >= input.successCriteria.length) {
+                                    attestNotes.push(`Rejected: criterion_index ${e?.criterion_index} out of range (1..${input.successCriteria.length}).`);
+                                    continue;
+                                }
+                                if (quote.length < 15) {
+                                    attestNotes.push(`Rejected criterion ${e?.criterion_index}: observation_quote must be ≥15 chars (got ${quote.length}).`);
+                                    continue;
+                                }
+                                const crit = input.successCriteria[idx];
+                                if (passedCriteria.has(crit))
+                                    continue; // already done
+                                if (recentResults.includes(quote.toLowerCase())) {
+                                    passedCriteria.add(crit);
+                                    attestNotes.push(`✓ Attested criterion ${idx + 1} DONE via quote: "${quote.slice(0, 60)}…"`);
+                                }
+                                else {
+                                    attestNotes.push(`Rejected criterion ${e?.criterion_index}: observation_quote "${quote.slice(0, 60)}…" NOT found in last 3 tool results. Quote verbatim text from a peek/assert you actually ran.`);
+                                }
+                            }
                             const pending = input.successCriteria.filter((c) => !passedCriteria.has(c));
                             if (pending.length > 0) {
                                 ok = false;
-                                resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending:\n${pending.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}\n\nEach pending criterion must be marked [✓ DONE] by asserting (assert_visible) against the END state described in the criterion — not an intermediate step. Keep going: finish the flow, observe the final UI, then assert each criterion's text. If you genuinely cannot reach the end state (real blocker, env issue, missing feature), call complete(status="blocked", summary=...) or complete(status="failed", summary=...) instead.`;
+                                const pendingIdxList = input.successCriteria
+                                    .map((c, i) => ({ c, i }))
+                                    .filter(({ c }) => !passedCriteria.has(c))
+                                    .map(({ c, i }) => `  ${i + 1}. ${c}`)
+                                    .join("\n");
+                                const attestBlock = attestNotes.length ? `\n\nAttestation results:\n${attestNotes.join("\n")}` : "";
+                                resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending (1-based index):\n${pendingIdxList}${attestBlock}\n\nOptions:\n  1) Continue the flow + assert_visible against the criterion's literal END state.\n  2) If a criterion is genuinely satisfied but the matcher's substring rule missed it, retry complete(passed) with criteria_evidence=[{criterion_index: N, observation_quote: "<15+ char verbatim text from your most recent peek or assert>"}] — be SPECIFIC.\n  3) If you cannot reach the end state, call complete(status="blocked", summary=...) or complete(status="failed", summary=...).`;
                             }
                             else {
                                 verdict = { status, summary, toolCalls, turns, trace };
-                                resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified).`;
+                                const attestBlock = attestNotes.length ? ` (${attestNotes.length} attestation(s))` : "";
+                                resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified)${attestBlock}.`;
                             }
                         }
                         else {
