@@ -41790,8 +41790,12 @@ function extractUserStatedQuantities(prompt) {
         const ctx = prompt.slice(ctxStart, ctxEnd);
         if (DATE_RE.test(ctx) || VERSION_RE.test(ctx))
             continue;
-        // Avoid duplicates of the same value+subject.
-        if (out.some((q) => q.value === value && q.subject.toLowerCase() === subject.toLowerCase()))
+        // Dedupe aggressively: same value + overlapping subject head (first two
+        // significant words) → drop. The regex matches greedily across overlapping
+        // phrase windows ("3 specific keywords" vs "3 keyword checkboxes" both
+        // come from the same "3 specific keywords" mention).
+        const subjHead = subject.toLowerCase().split(/\s+/).slice(0, 2).join(" ");
+        if (out.some((q) => q.value === value && q.subject.toLowerCase().split(/\s+/).slice(0, 2).join(" ") === subjHead))
             continue;
         out.push({ value, subject, raw });
     }
@@ -43857,14 +43861,16 @@ async function runAgent(input) {
                         steps.push(ok ? `Counted ${usedCount} of "${text}" (≥${minCount}, ${scopeNote}).` : `Insufficient "${text}" count (${usedCount}/${minCount}).`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
-                        // Record observation for the comment renderer to compare against
-                        // the user's stated quantities.
-                        quantitativeObservations.push({
+                        // Build the observation. We'll fill in matchedQuantityIndices
+                        // below if this measurement satisfies a synthesized "At least N X"
+                        // criterion for one of the user-stated quantities.
+                        const observation = {
                             text,
                             rowScopeCount,
                             pageScopeCount,
-                            atStep: steps.length
-                        });
+                            atStep: steps.length,
+                            matchedQuantityIndices: []
+                        };
                         // Quantity matcher: a criterion like "3 X are visible" or "exactly
                         // 3 X" or "at least 3 X" is DONE when count >= the number in the
                         // criterion AND the searched text overlaps with the criterion's
@@ -43885,6 +43891,31 @@ async function runAgent(input) {
                                 }
                             }
                         }
+                        // Direct association with user-stated quantities. If THIS
+                        // count_check call satisfies the "At least N <subject>" pattern
+                        // for a quantity (by value AND subject overlap with the criterion
+                        // line), tag the observation with that quantity's index. The PR
+                        // comment renderer prefers tagged observations over noun-matching
+                        // at render time — much more reliable.
+                        (input.userStatedQuantities ?? []).forEach((q, idx) => {
+                            if (!ok || usedCount < q.value)
+                                return;
+                            const subjLower = q.subject.toLowerCase();
+                            const tLower = text.toLowerCase();
+                            const subjectSignificantWords = subjLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
+                            const textSignificantWords = tLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
+                            const nounOverlap = subjectSignificantWords.some((w) => textSignificantWords.some((tw) => tw.includes(w) || w.includes(tw)));
+                            // OR: the agent measured something row-scoped with high count —
+                            // accept it as evidence of "this kind of row exists" when the
+                            // user's stated subject is a row-noun (rows, items, articles,
+                            // entries). For "3 rows", any high row-scoped count of a
+                            // per-row datum (date, status) counts.
+                            const isRowNoun = /\b(rows?|items?|entries|results?|records?|articles?)\b/.test(subjLower);
+                            if (nounOverlap || (isRowNoun && rowScopeCount >= q.value)) {
+                                observation.matchedQuantityIndices.push(idx);
+                            }
+                        });
+                        quantitativeObservations.push(observation);
                     }
                     else if (name === "complete") {
                         const status = inp.status ?? "blocked";
