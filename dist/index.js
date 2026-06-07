@@ -43458,7 +43458,7 @@ async function clickByRef(page, ref, options = {}) {
     }
     try {
         await loc.click({ timeout: 4000 });
-        return { ok: true, detail: `Clicked @${ref.replace(/^@/, "")} ("${label || "?"}").` };
+        return { ok: true, detail: `Clicked ${label ? `"${label}"` : ref.replace(/^@/, "")}.` };
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -43467,7 +43467,7 @@ async function clickByRef(page, ref, options = {}) {
             await page.waitForTimeout(300);
             try {
                 await loc.click({ timeout: 3000 });
-                return { ok: true, detail: `Clicked @${ref.replace(/^@/, "")} after Escape.` };
+                return { ok: true, detail: `Clicked ${ref.replace(/^@/, "")} after Escape.` };
             }
             catch {
                 return { ok: false, detail: `Click @${ref.replace(/^@/, "")} intercepted by overlay. Try press_key("Escape") first.` };
@@ -43483,9 +43483,20 @@ async function fillByRef(page, ref, value) {
     if (count === 0) {
         return { ok: false, detail: `Ref @${ref.replace(/^@/, "")} not found. Peek again to refresh refs.` };
     }
+    // Pull the field's human label for the step description (aria-label /
+    // placeholder / linked label) so the comment + dashboard read clean
+    // instead of "Filled @e24 …".
+    const label = await loc.evaluate((el) => {
+        const i = el;
+        return (i.getAttribute("aria-label") ||
+            i.getAttribute("placeholder") ||
+            (i.labels && i.labels[0]?.textContent) ||
+            i.name ||
+            "").toString().trim().slice(0, 60);
+    }).catch(() => "");
     try {
         await loc.fill(value, { timeout: 3000 });
-        return { ok: true, detail: `Filled @${ref.replace(/^@/, "")} with "${value.slice(0, 40)}${value.length > 40 ? "…" : ""}".` };
+        return { ok: true, detail: `Filled ${label ? `"${label}"` : ref.replace(/^@/, "")} with "${value.slice(0, 40)}${value.length > 40 ? "…" : ""}".` };
     }
     catch (err) {
         return { ok: false, detail: `Fill @${ref.replace(/^@/, "")} failed: ${err instanceof Error ? err.message.slice(0, 200) : ""}` };
