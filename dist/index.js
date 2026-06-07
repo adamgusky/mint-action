@@ -41935,17 +41935,19 @@ async function generateAgentBriefFromIntent(input) {
         // This is the deterministic safety net for K4 — the brief will ALWAYS
         // carry a criterion for each user-stated quantity.
         const synthesized = synthesizeQuantityCriteria(userStatedQuantities, brief.successCriteria);
-        // Failure-is-success safety net. If the user's prompt explicitly says
-        // it should fail / won't work / expect error / etc., append a permissive
-        // error-indicator criterion the agent can satisfy by asserting whatever
-        // error text the app actually renders. Skip if the LLM already wrote a
-        // similar criterion (so we don't pile up duplicates).
+        // Failure-is-success: when the user explicitly expects failure, REPLACE
+        // any LLM-generated criteria with just the permissive error-indicator
+        // criterion. The LLM tends to invent tautological extras ("the Test
+        // Connection button is present") that block the hard gate even though
+        // they're trivially true. In a failure test, the ONLY thing that matters
+        // is whether the failure indicator appears.
         const wantsFailure = isFailureExpected(input.testIntent);
-        const alreadyHasFailureCrit = brief.successCriteria.some((c) => /(error|failure|invalid|rejected|denied|not found|fail)/i.test(c));
-        const failureExtras = wantsFailure && !alreadyHasFailureCrit ? [synthesizeFailureCriterion()] : [];
+        const finalCriteria = wantsFailure
+            ? [synthesizeFailureCriterion(), ...synthesized]
+            : [...brief.successCriteria, ...synthesized];
         brief = {
             ...brief,
-            successCriteria: [...brief.successCriteria, ...synthesized, ...failureExtras],
+            successCriteria: finalCriteria,
             userPrompt: input.testIntent,
             userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined
         };
@@ -43672,7 +43674,7 @@ async function runAgentReplay(input) {
 }
 async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
-    const maxTurns = input.maxTurns ?? 20;
+    const maxTurns = input.maxTurns ?? 15;
     const trace = [];
     const quantitativeObservations = [];
     // Land on the entry page before the agent's first turn — saves one tool call.
