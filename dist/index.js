@@ -44134,7 +44134,7 @@ async function runAgent(input) {
                     ok = false;
                     resultText = `Tool ${name} threw: ${err instanceof Error ? err.message : String(err)}`;
                 }
-                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 400) });
+                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 4000) });
                 toolResults.push({
                     type: "tool_result",
                     tool_use_id: b.id,
