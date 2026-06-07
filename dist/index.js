@@ -43868,11 +43868,12 @@ async function runAgent(input) {
                                 const labelGuess = String(inp.label ?? "") || (ref ? `(ref ${ref})` : "");
                                 const isActionable = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail);
                                 if (isActionable) {
-                                    // Poll up to 10s for ANY DOM change beyond the initial post-click state.
-                                    // Take initial post-click hash, then keep polling.
+                                    // Slow APIs (DNS lookups, OAuth roundtrips, connection
+                                    // tests) can take 20-30s before any visible change. Poll
+                                    // up to 30s; exit early on the first DOM change.
                                     await page.waitForTimeout(500); // initial settle
                                     const initial = await pageStateHash(page);
-                                    const deadline = Date.now() + 10_000;
+                                    const deadline = Date.now() + 30_000;
                                     while (Date.now() < deadline) {
                                         await page.waitForTimeout(500);
                                         const now = await pageStateHash(page);
@@ -43887,8 +43888,17 @@ async function runAgent(input) {
                                 await input.onScreenshot?.(steps.length);
                                 const after = await pageStateHash(page);
                                 if (stateUnchanged(before, after)) {
-                                    resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state. DO NOT click the same target again — peek and pick a different action.`;
-                                    ok = false;
+                                    // For actionable clicks, an unchanged DOM after 30s most
+                                    // likely means the API is still in flight (or the
+                                    // response renders into something the hash misses) —
+                                    // tell the agent to peek again, NOT to retry the click.
+                                    if (isActionable) {
+                                        resultText += `\n⚠️ The click registered but the page hasn't changed after 30s. The backend call may still be processing — peek again (don't re-click, that's hard-refused). If still no response, the action may render its result asynchronously into a portal/toast.`;
+                                    }
+                                    else {
+                                        resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state. DO NOT click the same target again — peek and pick a different action.`;
+                                        ok = false;
+                                    }
                                 }
                             }
                         }
