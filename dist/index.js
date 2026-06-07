@@ -43858,15 +43858,31 @@ async function runAgent(input) {
                             resultText = out.detail;
                             if (out.ok) {
                                 steps.push(out.detail);
-                                // Clicks that trigger async server roundtrips (Test, Submit,
-                                // Connect, Save, Send, Apply) often render their result text
-                                // 1–2s later. Wait longer for those so the next peek sees
-                                // the actual server response (e.g., "Site not found" error)
-                                // instead of stale UI. Other clicks get the standard 400ms.
+                                // Smart wait: clicks on actionable controls (Test/Submit/
+                                // Connect/Save/etc.) often trigger async server roundtrips.
+                                // Instead of a fixed timeout that's either too short (response
+                                // not back yet) or too slow (every click pays the worst case),
+                                // poll for DOM changes up to 10s and exit as soon as something
+                                // changes. Non-actionable clicks just get the standard 400ms.
                                 const ACTIONABLE_LABEL = /\b(test|submit|connect|save|send|apply|verify|sync|publish|deploy|run|sign|log|reset|invite|generate)\b/i;
                                 const labelGuess = String(inp.label ?? "") || (ref ? `(ref ${ref})` : "");
-                                const waitMs = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail) ? 1800 : 400;
-                                await page.waitForTimeout(waitMs);
+                                const isActionable = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail);
+                                if (isActionable) {
+                                    // Poll up to 10s for ANY DOM change beyond the initial post-click state.
+                                    // Take initial post-click hash, then keep polling.
+                                    await page.waitForTimeout(500); // initial settle
+                                    const initial = await pageStateHash(page);
+                                    const deadline = Date.now() + 10_000;
+                                    while (Date.now() < deadline) {
+                                        await page.waitForTimeout(500);
+                                        const now = await pageStateHash(page);
+                                        if (!stateUnchanged(initial, now))
+                                            break;
+                                    }
+                                }
+                                else {
+                                    await page.waitForTimeout(400);
+                                }
                                 await captureScreenshot(page, runDir, steps.length);
                                 await input.onScreenshot?.(steps.length);
                                 const after = await pageStateHash(page);
