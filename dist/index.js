@@ -43610,7 +43610,7 @@ async function runAgentReplay(input) {
 }
 async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
-    const maxTurns = input.maxTurns ?? 60;
+    const maxTurns = input.maxTurns ?? 20;
     const trace = [];
     const quantitativeObservations = [];
     // Land on the entry page before the agent's first turn — saves one tool call.
