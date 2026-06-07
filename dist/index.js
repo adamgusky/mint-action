@@ -43227,13 +43227,30 @@ async function snapshotPage(page) {
                 value: (input.value || "").slice(0, 80)
             });
         });
-        document.querySelectorAll("h1, h2, h3, h4, [role='heading'], p, li, label, span").forEach((el) => {
-            if (!visible(el))
-                return;
-            const t = (el.textContent || "").replace(/\s+/g, " ").trim();
-            if (t.length > 1 && t.length < 200)
-                visibleText.push(t);
-        });
+        // Capture visible text from ANY element with its own direct text node
+        // (not just headings/labels/spans). Errors are often rendered as bare
+        // div text — the previous selector missed them and the agent went blind.
+        // We walk every element and take only nodes whose OWN direct text is
+        // non-empty (skips inherited textContent — that double-counts parents).
+        const walkText = (root) => {
+            const elements = root.querySelectorAll("*");
+            for (const el of Array.from(elements)) {
+                if (el.tagName === "SCRIPT" || el.tagName === "STYLE" || el.tagName === "NOSCRIPT")
+                    continue;
+                if (!visible(el))
+                    continue;
+                let ownText = "";
+                for (const node of Array.from(el.childNodes)) {
+                    if (node.nodeType === Node.TEXT_NODE)
+                        ownText += node.textContent || "";
+                }
+                ownText = ownText.replace(/\s+/g, " ").trim();
+                if (ownText.length > 1 && ownText.length < 240) {
+                    visibleText.push(ownText);
+                }
+            }
+        };
+        walkText(document.body);
         return {
             url: location.href,
             buttons: buttons.slice(0, 40),
@@ -43803,7 +43820,15 @@ async function runAgent(input) {
                             resultText = out.detail;
                             if (out.ok) {
                                 steps.push(out.detail);
-                                await page.waitForTimeout(400);
+                                // Clicks that trigger async server roundtrips (Test, Submit,
+                                // Connect, Save, Send, Apply) often render their result text
+                                // 1–2s later. Wait longer for those so the next peek sees
+                                // the actual server response (e.g., "Site not found" error)
+                                // instead of stale UI. Other clicks get the standard 400ms.
+                                const ACTIONABLE_LABEL = /\b(test|submit|connect|save|send|apply|verify|sync|publish|deploy|run|sign|log|reset|invite|generate)\b/i;
+                                const labelGuess = String(inp.label ?? "") || (ref ? `(ref ${ref})` : "");
+                                const waitMs = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail) ? 1800 : 400;
+                                await page.waitForTimeout(waitMs);
                                 await captureScreenshot(page, runDir, steps.length);
                                 await input.onScreenshot?.(steps.length);
                                 const after = await pageStateHash(page);
