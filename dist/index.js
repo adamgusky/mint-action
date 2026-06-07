@@ -41739,6 +41739,39 @@ function smartTruncate(value, max) {
  * renderer compares them against observed counts.
  */
 /**
+ * Detect failure-is-success language in the user's prompt. Returns true if
+ * the user explicitly stated they expect the test to fail / error / not
+ * work / be rejected. When true, the brief gets an extra synthetic
+ * criterion enumerating common error vocabulary so the agent has a wide
+ * substring net to match whatever the app actually renders.
+ */
+function isFailureExpected(prompt) {
+    if (!prompt)
+        return false;
+    const p = prompt.toLowerCase();
+    // Conservative — require an explicit hint that failure IS the expected
+    // outcome, not just incidental mention of "error".
+    return (/\b(it|that|this|connection|attempt|request|submission)?\s*(should|will|wo(?:n['']?|n)t|shouldn['']?t|must|expected to)\s+(fail|error(?:\s+out)?|not\s+work|be\s+rejected|be\s+blocked|throw)/i.test(p) ||
+        /\bwhen\s+it\s+fails\s+you['']?re\s+done\b/i.test(p) ||
+        /\bexpect\s+(an?\s+)?(error|failure)\b/i.test(p) ||
+        /\b(invalid|fake|bogus|made[- ]up|wrong)\s+(credentials?|input|password|user|email|token|url)\b/i.test(p) ||
+        /\bshould\s+(reject|block|deny|refuse|error|fail)\b/i.test(p));
+}
+/**
+ * Build a synthetic "failure indicator visible" criterion. The criterion text
+ * enumerates a broad error vocabulary so any of them, asserted by the agent
+ * after peeking the post-action page, matches via substring inclusion.
+ */
+function synthesizeFailureCriterion() {
+    return ("An error or failure indicator appears in the UI after the action " +
+        "(common phrasings the agent should look for and assert_visible against, " +
+        "case-insensitive substring of any one suffices: 'not found', 'failed', " +
+        "'fail', 'invalid', 'error', 'incorrect', 'denied', 'wrong', 'cannot', " +
+        "'unable', 'rejected', 'blocked', 'forbidden', 'unauthorized'). " +
+        "The agent MUST peek the page after the destructive action to read the " +
+        "literal error text the app renders, then assert_visible that specific text.");
+}
+/**
  * Generate synthetic success criteria from user-stated quantities that
  * aren't already covered by the existing criteria. Each cardinal in the
  * user's prompt becomes an "At least N <subject>" criterion the agent
@@ -41833,6 +41866,10 @@ The brief has four pieces:
    - Bad: "A planning indicator appears after clicking Submit" — when the user asked for "the new entry appears in the History table"
    - Good: "The new entry appears in the History table after submit"
 
+   **FAILURE-IS-SUCCESS PROMPTS.** When the developer's intent contains phrases like "it won't work", "it should fail", "expect an error", "when it fails you're done", "test that it rejects ...", "test that it errors out", "make sure invalid X is blocked", "shouldn't work" — the success criterion is the **appearance of ANY error/failure indicator** after the destructive action. Do NOT pre-guess specific error wording (apps render errors as "Site not found", "Invalid credentials", "Connection failed", "Cannot connect", "Failed", "Error", a red toast, an inline message — wording is unpredictable). Instead, the criterion must explicitly enumerate the broad error vocabulary so the agent has a substring to assert against once it has seen the page. Example criterion:
+   "An error/failure indicator appears after submission. Common phrasings to look for in the rendered UI: 'not found', 'failed', 'invalid', 'error', 'incorrect', 'denied', 'wrong', 'cannot', 'unable', 'rejected', 'blocked'. The agent should peek the page after the destructive action, identify whichever error text actually appears, and assert_visible against that specific text."
+   Add a hint to the brief: "After triggering the destructive action, do a peek to discover the literal error text the app renders — do NOT guess. Once you see it, assert_visible against that exact text."
+
    **LOCK USER-STATED CARDINAL NUMBERS.** If the developer wrote a literal number ("3 articles", "5 rows", "2 keywords"), that number MUST appear unchanged in the criterion. Do NOT relax "3" to "at least 3" or ">=3" or "some". The number is the user's explicit ask; if reality diverges, that's a finding for them — not a license for you to loosen the bar. If the app's behavior makes the literal number unachievable in practice (e.g., the app schedules a fixed batch per submit regardless of input), STILL use the user's literal number in the criterion AND add a hint flagging the divergence. Examples:
    - User: "see 3 article rows appear" → criterion: "3 newly scheduled article rows appear in the dashboard list" (NOT "at least 3", NOT "3 or more")
    - User: "exactly 5 results" → criterion: "exactly 5 results visible"
@@ -41898,9 +41935,17 @@ async function generateAgentBriefFromIntent(input) {
         // This is the deterministic safety net for K4 — the brief will ALWAYS
         // carry a criterion for each user-stated quantity.
         const synthesized = synthesizeQuantityCriteria(userStatedQuantities, brief.successCriteria);
+        // Failure-is-success safety net. If the user's prompt explicitly says
+        // it should fail / won't work / expect error / etc., append a permissive
+        // error-indicator criterion the agent can satisfy by asserting whatever
+        // error text the app actually renders. Skip if the LLM already wrote a
+        // similar criterion (so we don't pile up duplicates).
+        const wantsFailure = isFailureExpected(input.testIntent);
+        const alreadyHasFailureCrit = brief.successCriteria.some((c) => /(error|failure|invalid|rejected|denied|not found|fail)/i.test(c));
+        const failureExtras = wantsFailure && !alreadyHasFailureCrit ? [synthesizeFailureCriterion()] : [];
         brief = {
             ...brief,
-            successCriteria: [...brief.successCriteria, ...synthesized],
+            successCriteria: [...brief.successCriteria, ...synthesized, ...failureExtras],
             userPrompt: input.testIntent,
             userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined
         };
@@ -43029,6 +43074,7 @@ OPERATING PRINCIPLES
 - After completing each success criterion, verify it with assert_visible — marks it [✓ DONE] in your tracker.
 - For NEGATIVE criteria ("X is no longer visible", "X is gone", "X is closed"), call assert_visible against the SUBJECT (e.g., the modal heading) — a TIMEOUT counts as proof of absence and marks the criterion DONE.
 - For QUANTITY criteria ("at least N rows visible", "N items appear"), use count_check(text, minCount). The text should be a substring shared by every row/item (a column label visible per row, a date pattern, a status tag). When count ≥ N AND text overlaps the criterion noun, the criterion is auto-marked DONE.
+- For FAILURE-IS-SUCCESS criteria (user said "it'll fail", "expect an error", "should fail", "won't work"; or the criterion mentions appearance of an error/failure indicator), **do NOT pre-guess specific error text**. Trigger the destructive action, **peek the page**, READ what error text the app actually rendered (e.g., "Site not found", "Invalid credentials", "Connection failed"), then assert_visible against THAT specific text. The user-prompt-driven criterion enumerates a broad error vocabulary so any one of those words/phrases will satisfy it via substring match.
 
 EFFICIENCY
 - Don't peek twice in a row without acting.
