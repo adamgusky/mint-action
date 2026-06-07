@@ -43811,7 +43811,7 @@ async function runAgent(input) {
 - Compare to the previous screenshot — what changed?`
                             : "";
                         resultText = baseText + visualHint;
-                        trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 400) });
+                        trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 4000) });
                         toolResults.push({
                             type: "tool_result",
                             tool_use_id: b.id,
