@@ -43251,6 +43251,24 @@ async function snapshotPage(page) {
             }
         };
         walkText(document.body);
+        // Dedupe and prioritize: error/status-shaped text first, then the rest.
+        // Why: pages routinely render 30-60 small text nodes (help text, labels,
+        // tooltips) and a single short error message like "Site not found" was
+        // getting truncated out of the visibleText cap. Reordering ensures the
+        // agent always sees error/success cues even on busy pages.
+        const STATUS_RE = /\b(not found|failed|fail|invalid|error|incorrect|denied|wrong|cannot|unable|rejected|blocked|forbidden|unauthorized|success|saved|connected|verified|loading|pending|expired|timeout|missing|required)\b/i;
+        const seenText = new Set();
+        const prioritized = [];
+        const rest = [];
+        for (const t of visibleText) {
+            if (seenText.has(t))
+                continue;
+            seenText.add(t);
+            if (STATUS_RE.test(t) && t.length <= 120)
+                prioritized.push(t);
+            else
+                rest.push(t);
+        }
         return {
             url: location.href,
             buttons: buttons.slice(0, 40),
@@ -43258,7 +43276,7 @@ async function snapshotPage(page) {
             inputs: inputs.slice(0, 25),
             tabs,
             nav: Array.from(new Set(nav)).slice(0, 20),
-            visibleText: Array.from(new Set(visibleText)).slice(0, 40),
+            visibleText: [...prioritized, ...rest].slice(0, 80),
             modal: { open: !!modalEl, buttons: modalButtons.slice(0, 12), inputs: modalInputs.slice(0, 8) }
         };
     });
@@ -43307,8 +43325,17 @@ function formatSnapshot(s) {
             lines.push(`  @${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : " (empty)"}`);
     }
     if (s.visibleText.length) {
-        lines.push(`VISIBLE TEXT (first 20):`);
-        for (const t of s.visibleText.slice(0, 20))
+        // Highlight status/error/success cues at the top — these are usually
+        // the verification signal the agent is looking for.
+        const STATUS_RE = /\b(not found|failed|fail|invalid|error|incorrect|denied|wrong|cannot|unable|rejected|blocked|forbidden|unauthorized|success|saved|connected|verified)\b/i;
+        const statusLines = s.visibleText.filter((t) => STATUS_RE.test(t)).slice(0, 10);
+        if (statusLines.length) {
+            lines.push(`⚠️ STATUS/ERROR TEXT ON PAGE:`);
+            for (const t of statusLines)
+                lines.push(`  → "${t}"`);
+        }
+        lines.push(`VISIBLE TEXT (first 30):`);
+        for (const t of s.visibleText.slice(0, 30))
             lines.push(`  ${t}`);
     }
     return lines.join("\n");
