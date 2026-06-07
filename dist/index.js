@@ -43024,24 +43024,15 @@ const AGENT_TOOLS = [
         }
     }
 ];
-function systemPromptFor(input, progress) {
-    const criteriaWithStatus = input.successCriteria
-        .map((c, i) => {
-        const done = progress?.passedCriteria.has(c) ? "[✓ DONE]" : "[ ] pending";
-        return `  ${i + 1}. ${done} ${c}`;
-    })
-        .join("\n");
-    const recentTrace = progress?.recentTools.length
-        ? `RECENT ACTIONS (last ${progress.recentTools.length}):
-${progress.recentTools.map((t, i) => {
-            const idx = progress.recentTools.length - i;
-            const inp = JSON.stringify(t.input).slice(0, 80);
-            return `  -${idx}: ${t.ok ? "✓" : "✗"} ${t.tool}(${inp})`;
-        }).join("\n")}
-
-If your recent actions look repetitive (same tool + same input twice in a row), CHANGE STRATEGY. Repeating a click on an already-selected item, or peeking twice without acting, is wasted budget. Pick a different forward action.
-`
-        : "";
+/**
+ * Static system prompt — 100% constant within a single run, no per-turn
+ * mutations. This is what gets prompt-cached on the server. Dynamic
+ * per-turn context (criteria checkmarks + recent actions) lives in
+ * `progressBlock` and gets injected as a text block on each turn's user
+ * message — that keeps the system prefix byte-identical so cache reads hit.
+ */
+function staticSystemPrompt(input) {
+    const criteriaList = input.successCriteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n");
     const userPromptBlock = input.userPrompt
         ? `\nUSER'S LITERAL PROMPT (from the @mint comment — your ground truth):\n"""${input.userPrompt}"""\n`
         : "";
@@ -43057,10 +43048,9 @@ GOAL: ${input.goal}
 ENTRY: ${input.entryUrl}
 ${userPromptBlock}${quantityBlock}
 SUCCESS CRITERIA (every one must be verifiably satisfied before you call complete with status="passed"):
-${criteriaWithStatus}
+${criteriaList}
 
 ${input.hints?.length ? `HINTS FROM CODE READING:\n${input.hints.map((h) => `  - ${h}`).join("\n")}\n` : ""}
-${recentTrace}
 OPERATING PRINCIPLES
 - **Use refs, not labels.** Every peek returns a stable handle like @e1, @e2 for each interactive element. Pass ref="e1" to click/fill — it's unambiguous and saves tokens. Use label only as a fallback when you haven't peeked since the last action.
 - **peek (text-only) is your default.** It's cheap. Reach for peek_visual ONLY when you need to see something the text can't tell you (selection rings, spinners, image previews, success ticks).
@@ -43079,7 +43069,33 @@ OPERATING PRINCIPLES
 EFFICIENCY
 - Don't peek twice in a row without acting.
 - Aim to make forward progress every 1-2 turns. If 5+ turns have passed with no new [✓ DONE] criteria, step back: re-read your progress + recent actions, pick the SINGLE most likely forward control, click it.
-- When all success criteria show [✓ DONE], call complete with status="passed" immediately. Don't add extra checks.`;
+- When all success criteria show [✓ DONE], call complete with status="passed" immediately. Don't add extra checks.
+
+Each turn, you'll receive a CONTEXT UPDATE block (prepended to tool_results) showing which criteria are currently DONE and your last few actions. Treat that as your live progress tracker.`;
+}
+/**
+ * Per-turn context: criteria progress + recent actions. Built fresh each
+ * turn. Lives in a user-role text block (not in system), so the static
+ * system prefix stays byte-identical and prompt caching hits.
+ */
+function progressBlock(input, progress) {
+    const criteriaWithStatus = input.successCriteria
+        .map((c, i) => {
+        const done = progress.passedCriteria.has(c) ? "[✓ DONE]" : "[ ] pending";
+        return `  ${i + 1}. ${done} ${c.slice(0, 200)}${c.length > 200 ? "…" : ""}`;
+    })
+        .join("\n");
+    // Cap recent actions to last 5 — older context is dead weight.
+    const recent = progress.recentTools.slice(-5);
+    const recentTrace = recent.length
+        ? `\nRECENT ACTIONS (last ${recent.length}):
+${recent.map((t, i) => {
+            const idx = recent.length - i;
+            const inp = JSON.stringify(t.input).slice(0, 80);
+            return `  -${idx}: ${t.ok ? "✓" : "✗"} ${t.tool}(${inp})`;
+        }).join("\n")}\n\nIf the last 2 actions are the same tool+input, CHANGE STRATEGY — that's wasted budget.`
+        : "";
+    return `=== CONTEXT UPDATE ===\nCRITERIA STATUS:\n${criteriaWithStatus}${recentTrace}\n=== END CONTEXT ===`;
 }
 function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
     if (/^https?:\/\//i.test(pathOrUrl))
@@ -43674,18 +43690,15 @@ async function runAgent(input) {
     let toolCalls = 0;
     let verdict = null;
     // Track which success criteria have been verified so we can render
-    // "[✓ DONE] / [ ] pending" in the system prompt every turn.
+    // "[✓ DONE] / [ ] pending" in the per-turn progress block.
     const passedCriteria = new Set();
+    // Static system prompt — build once. Per-turn progress goes in user msgs
+    // so the system prefix stays byte-identical → prompt-cache hits.
+    const system = staticSystemPrompt(input);
     while (turns < maxTurns && !verdict) {
         turns++;
         let response;
         try {
-            // Rebuild the system prompt each turn with current progress + last
-            // few actions so the LLM can't lose track of where it is.
-            const system = systemPromptFor(input, {
-                passedCriteria,
-                recentTools: trace.slice(-6).map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
-            });
             response = await agent({ system, messages, tools: AGENT_TOOLS, maxTokens: 2048 });
         }
         catch (err) {
@@ -44080,7 +44093,18 @@ async function runAgent(input) {
             break;
         }
         if (toolResults.length > 0) {
-            messages.push({ role: "user", content: toolResults });
+            // Append the per-turn progress block as a text block in the same
+            // user message. This keeps the static system prompt byte-identical
+            // (so it cache-hits on Anthropic) while still feeding the agent
+            // fresh criteria/recent-tools context every turn.
+            const progressText = progressBlock(input, {
+                passedCriteria,
+                recentTools: trace.map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
+            });
+            messages.push({
+                role: "user",
+                content: [...toolResults, { type: "text", text: progressText }]
+            });
         }
     }
     return verdict ?? {
