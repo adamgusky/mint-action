@@ -26049,14 +26049,6 @@ module.exports = {
 
 /***/ }),
 
-/***/ 7989:
-/***/ ((module) => {
-
-module.exports = eval("require")("./config-resolver");
-
-
-/***/ }),
-
 /***/ 2613:
 /***/ ((module) => {
 
@@ -42308,8 +42300,6 @@ function historyPath(paths, flowId) {
     return external_node_path_namespaceObject.join(paths.flowsDir, `${safe}.history.json`);
 }
 
-// EXTERNAL MODULE: ../../node_modules/.pnpm/@vercel+ncc@0.38.4/node_modules/@vercel/ncc/dist/ncc/@@notfound.js?./config-resolver
-var _notfoundconfig_resolver = __nccwpck_require__(7989);
 ;// CONCATENATED MODULE: ../engine/dist/index.js
 
 
@@ -42417,6 +42407,14 @@ const mintConfigSchema = objectType({
         }).default({})
     }).default({})
 });
+// Two-step re-export (import-then-export rather than `export { x } from "..."`).
+// Reason: ncc, when bundling consumers of this package, sometimes can't
+// statically resolve `export { x } from "./y"` and falls back to
+// `eval("require")("./y")` at runtime — which then fails because the
+// bundled output doesn't ship "./y" as a sibling file. The
+// import-then-export form is semantically identical but ncc inlines it
+// correctly. Real failure observed in mint-action v2 dist on the runner.
+
 
 function resolveMintPaths(options = {}) {
     const cwd = path.resolve(options.cwd ?? process.cwd());
