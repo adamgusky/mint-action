@@ -41988,13 +41988,15 @@ function generate_agent_brief_buildPrompt(input) {
     // visible" steps that pass on a page where only the hero rendered and
     // miss palette / layout regressions in the sections below the fold.
     const visualTourHint = input.config.auth.method === "none"
-        ? `\n\nVISUAL REVIEW MODE: this app has no auth (it's a public marketing/landing page). The agent should:
-  - Use the scroll tool (amount="page_down") to walk down the page one viewport at a time, calling peek_visual between each scroll so each step's screenshot captures a different section
-  - Continue scrolling until peek_visual shows the footer / "scroll position unchanged (already at edge)" appears in the scroll result
-  - Verify the visual styling (colors, spacing, typography) matches the PR description, not just that text strings exist
-  - For palette PRs: explicitly check that no off-palette colors appear anywhere — call out any leftover colors that contradict the PR's intent (e.g. if the PR removes yellow/blue, any visible yellow/blue element is a finding)
-  - End with complete(status=passed) only after you have seen the footer AND every section's styling matches the intent
-The brief's successCriteria should reflect this visual frame ("hero/banner section uses the new palette", "every section from hero to footer renders the new palette") rather than "verify <text> is visible" checks. Persona MUST be the empty string "" for this app.`
+        ? `\n\nVISUAL REVIEW MODE (auth: none): this is a public marketing/landing page. The PR is asking for human visual review, not functional verification. Use the SHOW-MODE tool sequence:
+
+  1. Call \`visual_tour\` ONCE (default max_viewports=12). This single call scrolls the page from top to bottom in viewport-sized steps, saving a step screenshot at each position. All of those screenshots automatically render in the PR comment for the developer to scroll through.
+  2. Optionally call \`peek\` (text-only, NEVER peek_visual) once if you want to read a specific section's copy to mention it in your summary.
+  3. Call \`complete(status="passed", summary="...")\` with a one-paragraph note about what the human will see: "Tour captured N viewports. Palette is consistent — violet accents, white backgrounds, no off-palette colors observed. The footer renders with [...]." Total: 2-3 turns, not 10+.
+
+  DO NOT loop scroll+peek_visual manually. That burns ~$1.50 in tokens and bloats the conversation with base64 image data. The agent loop's automatic step screenshots are how the human sees the tour — the agent doesn't need its own visual context.
+
+The brief's successCriteria should reflect SHOW intent: ONE single criterion like "visual tour of the landing renders the intended palette/layout across all sections" is enough — the human evaluates the captured screenshots. Don't multiply criteria. Persona MUST be the empty string "" for this app.`
         : "";
     return `Developer's testIntent:
 """
@@ -43031,6 +43033,19 @@ const AGENT_TOOLS = [
         }
     },
     {
+        name: "visual_tour",
+        description: "Capture a full-page visual tour in ONE call. Scrolls to top, screenshots, then scrolls down one viewport at a time, screenshotting after each scroll, until the bottom of the page is reached. Returns a text summary (page height, viewports captured) — does NOT return images in the response (those are saved as step artifacts the user sees in the PR comment). Use this for visual/design review of marketing landing pages instead of looping scroll+peek_visual yourself — that approach burns 10+ turns and bloats the conversation with base64 image data. After visual_tour returns, call complete with a summary of what you observed (color palette, layout, any obvious issues).",
+        input_schema: {
+            type: "object",
+            properties: {
+                max_viewports: {
+                    type: "number",
+                    description: "Safety cap on screenshots. Default 12 (covers a ~12000px landing page at typical viewport height). Pages longer than this are truncated at the cap."
+                }
+            }
+        }
+    },
+    {
         name: "assert_visible",
         description: "Verify a piece of text is visible on the page. Polls for up to 20s by default. Use to confirm a success state has actually arrived.",
         input_schema: {
@@ -43748,6 +43763,23 @@ async function runAgentReplay(input) {
                 resultText = `Scrolled (${amount}).`;
                 steps.push(resultText);
             }
+            else if (entry.tool === "visual_tour") {
+                const maxViewports = Math.min(Math.max(Number(inp.max_viewports ?? 12), 1), 30);
+                await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                await page.waitForTimeout(450);
+                let prevY = -1;
+                for (let i = 0; i < maxViewports; i++) {
+                    steps.push(`visual_tour viewport ${i + 1}/${maxViewports}`);
+                    await captureScreenshot(page, runDir, steps.length);
+                    const y = await page.evaluate(() => window.scrollY);
+                    if (y === prevY)
+                        break;
+                    prevY = y;
+                    await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                    await page.waitForTimeout(450);
+                }
+                resultText = `visual_tour replay complete.`;
+            }
             else if (entry.tool === "assert_visible") {
                 const text = String(inp.text ?? "");
                 const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout: 20_000 }).catch(() => false);
@@ -44057,6 +44089,28 @@ async function runAgent(input) {
                         steps.push(`Scrolled (${amount}).`);
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
+                    }
+                    else if (name === "visual_tour") {
+                        const maxViewports = Math.min(Math.max(Number(inp.max_viewports ?? 12), 1), 30);
+                        await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                        await page.waitForTimeout(450);
+                        const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+                        const viewportHeight = await page.evaluate(() => window.innerHeight);
+                        let captured = 0;
+                        let prevY = -1;
+                        for (let i = 0; i < maxViewports; i++) {
+                            steps.push(`visual_tour viewport ${i + 1}/${maxViewports}`);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                            captured++;
+                            const y = await page.evaluate(() => window.scrollY);
+                            if (y === prevY)
+                                break;
+                            prevY = y;
+                            await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                            await page.waitForTimeout(450);
+                        }
+                        resultText = `visual_tour complete: captured ${captured} viewports of a ${pageHeight}px tall page (viewport ${viewportHeight}px). All shots saved as step artifacts and will appear in the PR comment. Now call complete with a summary of the visual review.`;
                     }
                     else if (name === "assert_visible") {
                         const text = String(inp.text ?? "");
