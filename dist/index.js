@@ -26049,6 +26049,14 @@ module.exports = {
 
 /***/ }),
 
+/***/ 7989:
+/***/ ((module) => {
+
+module.exports = eval("require")("./config-resolver");
+
+
+/***/ }),
+
 /***/ 2613:
 /***/ ((module) => {
 
@@ -41901,7 +41909,12 @@ const briefSchema = objectType({
     entryUrl: stringType().min(1),
     successCriteria: arrayType(stringType().min(2)).min(1).max(8),
     hints: arrayType(stringType()).default([]),
-    persona: stringType().min(1),
+    // Empty persona is allowed: public/marketing pages (auth.method: "none")
+    // have no personas defined in mint.yml, so there's nothing for the LLM to
+    // pick. The agent loop treats an empty string as "anonymous visitor".
+    // Auth'd apps still get the implicit min-1 contract from the prompt — the
+    // LLM is told to choose from config.auth.personas, which is non-empty.
+    persona: stringType(),
     // userPrompt + userStatedQuantities are post-processed after the LLM
     // returns; we tolerate them in the schema in case the LLM volunteers them
     // but the canonical source is the regex extractor below.
@@ -41960,9 +41973,12 @@ async function generateAgentBriefFromIntent(input) {
     };
 }
 function generate_agent_brief_buildPrompt(input) {
-    const personas = Object.entries(input.config.auth.personas)
+    const personaEntries = Object.entries(input.config.auth.personas);
+    const personas = personaEntries
         .map(([id, p]) => `  - ${id}: plan=${p.plan ?? "none"}, role=${p.role ?? "none"}, seeded_data=${(p.data ?? []).join(",") || "none"}`)
-        .join("\n") || "  (no personas)";
+        .join("\n") || (input.config.auth.method === "none"
+        ? "  (none — this is a public/marketing page; emit persona: \"\")"
+        : "  (no personas)");
     const routes = (input.productMap?.routes ?? [])
         .slice(0, 40)
         .map((r) => `  - ${r.path} (${r.name})`)
@@ -41973,6 +41989,21 @@ function generate_agent_brief_buildPrompt(input) {
     const diffBlock = input.diffText ? `\n\nPR DIFF (additional context):\n${generate_agent_brief_truncate(input.diffText, 10_000)}` : "";
     const personaHint = input.persona ? `\n\nDeveloper requested persona: ${input.persona}` : "";
     const routesHint = input.relatedRoutes?.length ? `\n\nParser-suggested routes: ${input.relatedRoutes.join(", ")}` : "";
+    // Marketing landing pages (auth: none) are reviewed visually, not
+    // functionally. Tell the agent to scroll through every section instead of
+    // just checking that a few text strings are present at the top of the
+    // viewport. Otherwise the brief generator produces "verify Pricing is
+    // visible" steps that pass on a page where only the hero rendered and
+    // miss palette / layout regressions in the sections below the fold.
+    const visualTourHint = input.config.auth.method === "none"
+        ? `\n\nVISUAL REVIEW MODE: this app has no auth (it's a public marketing/landing page). The agent should:
+  - Use the scroll tool (amount="page_down") to walk down the page one viewport at a time, calling peek_visual between each scroll so each step's screenshot captures a different section
+  - Continue scrolling until peek_visual shows the footer / "scroll position unchanged (already at edge)" appears in the scroll result
+  - Verify the visual styling (colors, spacing, typography) matches the PR description, not just that text strings exist
+  - For palette PRs: explicitly check that no off-palette colors appear anywhere — call out any leftover colors that contradict the PR's intent (e.g. if the PR removes yellow/blue, any visible yellow/blue element is a finding)
+  - End with complete(status=passed) only after you have seen the footer AND every section's styling matches the intent
+The brief's successCriteria should reflect this visual frame ("hero/banner section uses the new palette", "every section from hero to footer renders the new palette") rather than "verify <text> is visible" checks. Persona MUST be the empty string "" for this app.`
+        : "";
     return `Developer's testIntent:
 """
 ${input.testIntent}
@@ -41985,7 +42016,7 @@ ${personas}
 
 Routes:
 ${routes}
-${personaHint}${routesHint}
+${personaHint}${routesHint}${visualTourHint}
 
 SOURCE FILES (read these so successCriteria references real on-screen text):
 ${fileBlocks}
@@ -42277,6 +42308,8 @@ function historyPath(paths, flowId) {
     return external_node_path_namespaceObject.join(paths.flowsDir, `${safe}.history.json`);
 }
 
+// EXTERNAL MODULE: ../../node_modules/.pnpm/@vercel+ncc@0.38.4/node_modules/@vercel/ncc/dist/ncc/@@notfound.js?./config-resolver
+var _notfoundconfig_resolver = __nccwpck_require__(7989);
 ;// CONCATENATED MODULE: ../engine/dist/index.js
 
 
@@ -42322,7 +42355,14 @@ const mintConfigSchema = objectType({
     app: objectType({
         name: stringType(),
         base_url: stringType(),
-        mode: enumType(["local", "preview", "staging", "production"]).default("local")
+        mode: enumType(["local", "preview", "staging", "production"]).default("local"),
+        // Globs matched against PR-changed file paths. When set, this config is
+        // only selected when at least one changed file matches. Absent = wildcard
+        // (legacy single-config behavior).
+        scope: arrayType(stringType()).optional(),
+        // Workflow file under .github/workflows/ to dispatch for this app.
+        // Absent = "mint.yml" (legacy behavior).
+        workflow: stringType().default("mint.yml")
     }),
     services: recordType(objectType({
         command: stringType(),
@@ -42377,6 +42417,7 @@ const mintConfigSchema = objectType({
         }).default({})
     }).default({})
 });
+
 function resolveMintPaths(options = {}) {
     const cwd = path.resolve(options.cwd ?? process.cwd());
     const configPath = path.resolve(cwd, options.config ?? "mint.yml");
@@ -42975,6 +43016,20 @@ const AGENT_TOOLS = [
             type: "object",
             properties: { key: { type: "string" } },
             required: ["key"]
+        }
+    },
+    {
+        name: "scroll",
+        description: "Scroll the viewport. Use this to reveal sections below the fold on long pages (marketing landing pages, dashboards with multiple stacked sections, infinite-scroll lists). After scrolling, peek again to see what's now in view — peek snapshots only render the visible viewport. amount=\"page_down\" advances ~one screen at a time and is the right default for a section-by-section tour.",
+        input_schema: {
+            type: "object",
+            properties: {
+                amount: {
+                    type: "string",
+                    description: "\"page_down\" | \"page_up\" | \"top\" | \"bottom\" | a pixel count as string (e.g. \"600\")."
+                }
+            },
+            required: ["amount"]
         }
     },
     {
@@ -43671,6 +43726,30 @@ async function runAgentReplay(input) {
                 resultText = `Pressed ${key}.`;
                 steps.push(resultText);
             }
+            else if (entry.tool === "scroll") {
+                const amount = String(inp.amount ?? "page_down");
+                if (amount === "page_down") {
+                    await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                }
+                else if (amount === "page_up") {
+                    await page.evaluate(() => window.scrollBy({ top: -Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                }
+                else if (amount === "top") {
+                    await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                }
+                else if (amount === "bottom") {
+                    await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, left: 0, behavior: "instant" }));
+                }
+                else {
+                    const px = Number.parseInt(amount, 10);
+                    if (Number.isFinite(px)) {
+                        await page.evaluate((p) => window.scrollBy({ top: p, left: 0, behavior: "instant" }), px);
+                    }
+                }
+                await page.waitForTimeout(450);
+                resultText = `Scrolled (${amount}).`;
+                steps.push(resultText);
+            }
             else if (entry.tool === "assert_visible") {
                 const text = String(inp.text ?? "");
                 const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout: 20_000 }).catch(() => false);
@@ -43940,6 +44019,46 @@ async function runAgent(input) {
                         if (stateUnchanged(before, after)) {
                             resultText += `\n⚠️ No observable effect: page unchanged after pressing ${key}. Don't repeat this key — pick a different action.`;
                         }
+                    }
+                    else if (name === "scroll") {
+                        const amount = String(inp.amount ?? "page_down");
+                        const beforeY = await page.evaluate(() => window.scrollY);
+                        if (amount === "page_down") {
+                            await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                        }
+                        else if (amount === "page_up") {
+                            await page.evaluate(() => window.scrollBy({ top: -Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                        }
+                        else if (amount === "top") {
+                            await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                        }
+                        else if (amount === "bottom") {
+                            await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, left: 0, behavior: "instant" }));
+                        }
+                        else {
+                            const px = Number.parseInt(amount, 10);
+                            if (Number.isFinite(px)) {
+                                await page.evaluate((p) => window.scrollBy({ top: p, left: 0, behavior: "instant" }), px);
+                            }
+                            else {
+                                resultText = `Invalid scroll amount "${amount}". Use page_down | page_up | top | bottom | <pixel count>.`;
+                                steps.push(`Invalid scroll amount.`);
+                                trace.push({ tool: "scroll", input: inp, ok: false, result: resultText });
+                                toolResults.push({ type: "tool_result", tool_use_id: b.id, content: resultText });
+                                continue;
+                            }
+                        }
+                        // Let scroll-triggered animations (fade-in-up, parallax, lazy
+                        // images) settle before we screenshot.
+                        await page.waitForTimeout(450);
+                        const afterY = await page.evaluate(() => window.scrollY);
+                        const delta = afterY - beforeY;
+                        resultText = delta === 0
+                            ? `Scrolled (${amount}) — but scroll position unchanged (already at edge?). Peek to see what's currently in view.`
+                            : `Scrolled ${delta > 0 ? "down" : "up"} ${Math.abs(delta)}px (now at y=${afterY}). Peek to see what's now in view.`;
+                        steps.push(`Scrolled (${amount}).`);
+                        await captureScreenshot(page, runDir, steps.length);
+                        await input.onScreenshot?.(steps.length);
                     }
                     else if (name === "assert_visible") {
                         const text = String(inp.text ?? "");
