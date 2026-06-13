@@ -45706,16 +45706,15 @@ async function uploadMedia(opts) {
     if (!presignedUrl || !publicUrl) {
         throw new Error("Presign response missing presignedUrl or publicUrl");
     }
-    // PUT bytes directly to S3. Content-Type AND x-amz-acl must match
-    // what the server signed for — S3 enforces both and 403s on
-    // mismatch. ACL public-read mirrors the legacy blawg uploader so
-    // these objects are GET-able by GitHub's camo proxy for inline
-    // <img>/<video> rendering in PR comments.
+    // PUT bytes directly to S3. AWS SDK v3 hoists ACL into the presigned
+    // URL as ?x-amz-acl=public-read (not a signed header), so we MUST NOT
+    // send x-amz-acl as a header here — S3 will 403 with
+    // "HeadersNotSigned: x-amz-acl". Content-Type is signed via the
+    // PutObjectCommand input and must match.
     const putRes = await fetch(presignedUrl, {
         method: "PUT",
         headers: {
-            "Content-Type": opts.contentType,
-            "x-amz-acl": "public-read"
+            "Content-Type": opts.contentType
         },
         body: new Uint8Array(opts.data)
     });
