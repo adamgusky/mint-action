@@ -43714,7 +43714,13 @@ async function runAgentReplay(input) {
 }
 async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
-    const maxTurns = input.maxTurns ?? 15;
+    // 15 was too tight for multi-step flows: a signup + onboarding test
+    // legitimately spends 12-14 turns just reaching the page it wants to
+    // assert against, leaving zero budget for the actual assertions.
+    // Blawg PR #109's sticky-header test hit "Hit max turns" at turn 15
+    // immediately after the agent successfully scrolled to the section
+    // it was supposed to verify. 30 gives realistic flows room to land.
+    const maxTurns = input.maxTurns ?? 30;
     const trace = [];
     const quantitativeObservations = [];
     // Land on the entry page before the agent's first turn — saves one tool call.
