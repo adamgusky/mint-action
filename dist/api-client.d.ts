@@ -46,6 +46,41 @@ export interface CompleteInput {
         pageScopeCount: number;
         atStep: number;
     }>;
+    /** Per-assertion outcome with DOM evidence. Surfaces what was
+     *  actually confirmed (vs the freeform narrative summary) so
+     *  partial_verified runs can report concrete wins instead of
+     *  "blocked, sorry." */
+    verifiedAssertions?: Array<{
+        intent: string;
+        elementId?: string;
+        evidenceStepIndex?: number;
+        result: "ok" | "missing" | "ambiguous" | "blocked";
+        notes?: string;
+    }>;
+    /** Customer-actionable next steps. Attached on partial_verified /
+     *  upstream_blocked / agent_stuck / code_not_present so the comment
+     *  isn't just a dead-end status badge. */
+    recommendations?: Array<{
+        kind: "manual_verify" | "enable_upstream" | "fix_setup" | "rewrite_flow" | "fix_workflow" | "investigate";
+        summary: string;
+        link?: string;
+        details?: string;
+    }>;
+    /** Third-party API failures detected during the run. Drives the
+     *  upstream_blocked verdict path — your code isn't the problem. */
+    upstreamSignals?: Array<{
+        name: string;
+        url: string;
+        status: number;
+        excerpt?: string;
+    }>;
+    /** Provenance — surfaced at the top of every comment so a reviewer
+     *  can tell at a glance which commit was actually tested. */
+    testedSha?: string;
+    testedRef?: string;
+    workflowSourceSha?: string;
+    /** Best-effort run cost in USD. Lets customers reason about LLM spend. */
+    estimatedCostUsd?: number;
 }
 export declare class MintApi {
     private base;

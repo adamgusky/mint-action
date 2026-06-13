@@ -36564,6 +36564,128 @@ exports.visit = visit;
 exports.visitAsync = visitAsync;
 
 
+/***/ }),
+
+/***/ 7302:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   RepetitionGuard: () => (/* binding */ RepetitionGuard)
+/* harmony export */ });
+/**
+ * Watches the agent's tool stream and stops it from looping on a dead end.
+ *
+ * The motivating failure: PR #99's onboarding run burned 15 turns / 17
+ * tool calls clicking the same "Sign up" button. Each click failed in
+ * the same way; the agent's next-turn LLM call had no signal that
+ * "this didn't work last time" and just tried again. That's the kind of
+ * loop that produces a `blocked` verdict with no useful information at
+ * all — and costs roughly $2 in LLM tokens for the privilege.
+ *
+ * Strategy:
+ *   - After three back-to-back identical attempts at the same element
+ *     with no state change, force the next turn to try a different
+ *     approach (alternate selector, dismiss overlay, wait, or report
+ *     partial success and exit).
+ *   - After eight consecutive turns with no DOM change at all, abort
+ *     with a partial-success verdict — whatever the evidence ledger has
+ *     gets surfaced as `partial_verified`.
+ *   - Identical-but-different-element loops (e.g. tabbing through the
+ *     same modal) get caught by the no-DOM-change abort instead.
+ *
+ * Pure class with no side effects. Tests inject calls and assert the
+ * returned action so we don't need to spin up Playwright to verify the
+ * guard's behaviour.
+ */
+const DEFAULT_OPTS = {
+    identicalThreshold: 3,
+    stagnationThreshold: 8
+};
+class RepetitionGuard {
+    recent = [];
+    opts;
+    forcedStrategyChanges = 0;
+    constructor(opts = {}) {
+        this.opts = { ...DEFAULT_OPTS, ...opts };
+    }
+    /**
+     * Record the agent's latest tool call and decide whether to let the
+     * agent proceed, force a strategy change on the next turn, or abort.
+     */
+    check(call) {
+        this.recent.push(call);
+        if (this.isIdenticalLoop(call)) {
+            // If we've already forced a change once on this same target and
+            // we're STILL looping, the agent isn't responding to the hint —
+            // abort with partial rather than burn another redirect.
+            if (this.forcedStrategyChanges >= 1 && this.lastForcedTarget === call.targetId) {
+                return {
+                    kind: "abort_with_partial",
+                    reason: `Agent attempted ${this.opts.identicalThreshold}+ identical calls to ${call.tool}(${call.targetId ?? "?"}) ` +
+                        `even after a forced strategy change. Stopping before more budget is burned.`
+                };
+            }
+            this.forcedStrategyChanges += 1;
+            this.lastForcedTarget = call.targetId;
+            return {
+                kind: "force_strategy_change",
+                reason: `Last ${this.opts.identicalThreshold} attempts at ${call.tool}(${call.targetId ?? "?"}) ` +
+                    `had no DOM effect.`,
+                advice: this.adviceForLoop(call)
+            };
+        }
+        if (this.isStagnated()) {
+            return {
+                kind: "abort_with_partial",
+                reason: `${this.opts.stagnationThreshold} consecutive tool calls produced no DOM change. ` +
+                    `The agent appears to be stuck on a screen it can't move past — reporting partial ` +
+                    `verification with the evidence collected so far.`
+            };
+        }
+        return { kind: "proceed" };
+    }
+    /** Resets the per-target loop counter so a subsequent fresh attempt
+     *  at a NEW target isn't suppressed by a stale force_strategy_change.
+     *  The callsite should call this whenever the agent observably pivots
+     *  (different target, navigation, etc). */
+    recordPivot() {
+        this.forcedStrategyChanges = 0;
+        this.lastForcedTarget = undefined;
+    }
+    lastForcedTarget;
+    isIdenticalLoop(call) {
+        const N = this.opts.identicalThreshold;
+        if (this.recent.length < N)
+            return false;
+        const tail = this.recent.slice(-N);
+        return tail.every((r) => r.tool === call.tool &&
+            (r.targetId ?? "") === (call.targetId ?? "") &&
+            r.domChanged === false);
+    }
+    isStagnated() {
+        const N = this.opts.stagnationThreshold;
+        if (this.recent.length < N)
+            return false;
+        return this.recent.slice(-N).every((r) => r.domChanged === false);
+    }
+    /** The synthetic system message injected into the next agent turn
+     *  when force_strategy_change fires. Wording is load-bearing — the
+     *  agent uses it to plan the next move. */
+    adviceForLoop(call) {
+        const lines = [
+            `Your last ${this.opts.identicalThreshold} attempts to ${call.tool} on ${call.targetId ?? "the same target"} produced no observable change in the DOM.`,
+            `Try ONE of the following BEFORE retrying the same action:`,
+            `  (a) Look for a modal/overlay/cookie banner intercepting the click and dismiss it first.`,
+            `  (b) Use a different selector — text, role, or a parent landmark — for the same logical element.`,
+            `  (c) Wait for network idle or a specific element to appear, then re-attempt.`,
+            `  (d) If none of those apply, report what you HAVE verified via the partial-success path and exit. A useful partial verdict is much better than a blocked one.`
+        ];
+        return lines.join("\n");
+    }
+}
+
+
 /***/ })
 
 /******/ 	});
@@ -40866,6 +40988,121 @@ const coerce = {
 
 const NEVER = (/* unused pure expression or super */ null && (INVALID));
 
+;// CONCATENATED MODULE: ../engine/dist/preflight.js
+
+
+/**
+ * Verify every `source_assertions` entry in mint.yml resolves against the
+ * runner's checkout.
+ *
+ * Why this exists, in one paragraph: workflow_dispatch defaults to the
+ * base branch (typically `main`), so a misconfigured customer workflow
+ * silently runs the agent against pre-PR code. The agent then dutifully
+ * reports "the new tab isn't there" — a confident verdict about
+ * uninspected code, which is the worst failure mode for a review tool.
+ * `assertRunningOnExpectedSha` already catches the case where the
+ * mission's `_mintMeta.prSha` is known. This catches the complementary
+ * case: when the SHA is right but the PR's new code hasn't actually
+ * landed (cache miss, partial checkout, dist drift, etc), and lets
+ * customers express the check in plain `mint.yml` instead of a brittle
+ * git hook.
+ *
+ * Cost: a handful of fs reads. The cheapest possible safeguard.
+ */
+async function runPreflight(assertions, deps = {}) {
+    if (!assertions || assertions.length === 0) {
+        return {
+            passed: true,
+            results: [],
+            summary: "Preflight skipped: no source_assertions configured."
+        };
+    }
+    const cwd = deps.cwd ?? process.cwd();
+    const readFile = deps.readFile ?? defaultReadFile;
+    const results = [];
+    for (const assertion of assertions) {
+        const absPath = external_node_path_namespaceObject.isAbsolute(assertion.file)
+            ? assertion.file
+            : external_node_path_namespaceObject.join(cwd, assertion.file);
+        let contents;
+        try {
+            contents = await readFile(absPath);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            // Distinguish "the path doesn't exist" (almost always means the
+            // workflow checked out a tree without this file — usually a wrong
+            // SHA) from a real read error.
+            if (/ENOENT|no such file/i.test(msg)) {
+                results.push({ ok: false, assertion, cause: "file_missing", detail: msg });
+            }
+            else {
+                results.push({ ok: false, assertion, cause: "read_error", detail: msg });
+            }
+            continue;
+        }
+        if (contents.includes(assertion.contains)) {
+            results.push({ ok: true, assertion });
+        }
+        else {
+            results.push({ ok: false, assertion, cause: "string_missing" });
+        }
+    }
+    const failed = results.filter((r) => !r.ok);
+    if (failed.length === 0) {
+        return {
+            passed: true,
+            results,
+            summary: `Preflight passed: ${results.length} source assertion(s) verified on the runner.`
+        };
+    }
+    return {
+        passed: false,
+        results,
+        summary: formatFailureSummary(failed)
+    };
+}
+function defaultReadFile(filePath) {
+    return external_node_fs_namespaceObject.promises.readFile(filePath, "utf8");
+}
+/**
+ * The customer-facing error body. Exported so tests can pin wording
+ * regressions and so callers can include it verbatim in their failure
+ * payload — this message is the entire user-facing surface when this
+ * guard fires.
+ */
+function formatFailureSummary(failed) {
+    const lines = [
+        `Preflight failed: ${failed.length} source assertion(s) did not match the runner's checkout.`,
+        ``,
+        `Each assertion in mint.yml's preflight.source_assertions describes a string the PR's new code must contain. When one is missing, the runner is almost certainly on the wrong commit — workflow_dispatch defaults to the base branch, so without an explicit "git checkout <_mintMeta.prSha>" step the agent reviews the base branch and any verdict about new code becomes a false negative.`,
+        ``
+    ];
+    for (const f of failed) {
+        lines.push(`  - ${f.assertion.file}`);
+        if (f.cause === "file_missing") {
+            lines.push(`      file not found on the runner`);
+        }
+        else if (f.cause === "string_missing") {
+            lines.push(`      file exists but does not contain: ${truncate(f.assertion.contains, 80)}`);
+        }
+        else {
+            lines.push(`      read error: ${truncate(f.detail ?? "unknown", 120)}`);
+        }
+        if (f.assertion.reason) {
+            lines.push(`      reason: ${f.assertion.reason}`);
+        }
+        lines.push(``);
+    }
+    lines.push(`Fix: ensure your workflow checks out _mintMeta.prSha before running mint-action. See the snippet below or .github/workflows/mint-landing.yml in adamgusky/blawgy for a reference implementation.`);
+    return lines.join("\n");
+}
+function truncate(s, max) {
+    if (s.length <= max)
+        return s;
+    return s.slice(0, max - 1) + "…";
+}
+
 ;// CONCATENATED MODULE: ../engine/dist/enrichment.js
 
 
@@ -40972,7 +41209,7 @@ async function enrichRoute(input) {
     return { inputTokens: llmResult.inputTokens, outputTokens: llmResult.outputTokens };
 }
 function buildRoutePrompt(route, files) {
-    const fileBlocks = [...files.entries()].map(([relPath, content]) => `\n--- FILE: ${relPath} ---\n${truncate(content, 18_000)}`).join("\n");
+    const fileBlocks = [...files.entries()].map(([relPath, content]) => `\n--- FILE: ${relPath} ---\n${enrichment_truncate(content, 18_000)}`).join("\n");
     return `Route: ${route.path}
 Display name: ${route.name}
 Requires auth: ${route.requiresAuth}
@@ -41013,7 +41250,7 @@ function hashesEqual(a, b) {
 function sha256(value) {
     return createHash("sha256").update(value).digest("hex");
 }
-function truncate(value, max) {
+function enrichment_truncate(value, max) {
     if (value.length <= max)
         return value;
     return `${value.slice(0, max)}\n... (truncated, file is ${value.length} chars)`;
@@ -42321,6 +42558,8 @@ function historyPath(paths, flowId) {
 
 
 
+
+
 const stringRecordSchema = recordType(stringType());
 const optionalStringSchema = preprocessType((value) => value === null ? undefined : value, stringType().optional());
 /** Per-persona override of the global setup commands. Any key omitted falls
@@ -42407,7 +42646,45 @@ const mintConfigSchema = objectType({
             width: numberType().default(1440),
             height: numberType().default(1000)
         }).default({})
-    }).default({})
+    }).default({}),
+    // Preflight assertions run before the browser opens. They catch the
+    // single highest-leverage failure mode we've observed: a workflow that
+    // doesn't check out the PR head SHA, leaving the runner on `main`
+    // while the agent confidently reviews uninspected code. Each assertion
+    // is a tiny grep on a file under the runner CWD — fast, deterministic,
+    // and costs zero LLM tokens. If any assertion fails, the run reports
+    // `code_not_present` with the literal mismatch and skips the browser
+    // entirely.
+    preflight: objectType({
+        source_assertions: arrayType(objectType({
+            file: stringType(),
+            contains: stringType(),
+            reason: stringType().optional()
+        })).default([])
+    }).default({ source_assertions: [] }),
+    // Customer-declared upstream dependencies. When a feature relies on a
+    // third-party API (DataForSEO, Stripe, etc.), and the API returns an
+    // admin-actionable error (40204 access denied, 5xx outage, ...), the
+    // verdict reports `upstream_blocked` instead of `feature_broken` —
+    // your code isn't the problem. Each entry matches against our app's
+    // own API surface that wraps the dependency, plus a failure signal
+    // (response body excerpt + status). See packages/engine/src/upstream-
+    // signals.ts for the runtime classifier.
+    upstream_dependencies: arrayType(objectType({
+        name: stringType(),
+        matches_url: stringType(),
+        failure_signals: objectType({
+            response_body_contains: stringType().optional(),
+            response_status: numberType().int().optional()
+        }).default({}),
+        on_block: enumType([
+            "verify_cached_fallback_then_warn",
+            "skip_dependent_assertions",
+            "fail_with_recommendation"
+        ]).default("fail_with_recommendation"),
+        fallback_assertion: stringType().optional(),
+        enable_link: stringType().url().optional()
+    })).default([])
 });
 // Two-step re-export (import-then-export rather than `export { x } from "..."`).
 // Reason: ncc, when bundling consumers of this package, sometimes can't
@@ -43852,6 +44129,16 @@ async function runAgent(input) {
             role: "user",
             content: `You are now in the browser at the entry page. Peek to see what's there, then proceed toward the goal. Call complete when every success criterion is verifiably satisfied (or when you're confident you can't proceed).`
         }];
+    // The guard catches the exact pattern that burned PR #99's onboarding
+    // run: 9 redundant "Click Sign up" attempts, all with no DOM change.
+    // It compares each turn's last tool call against the running history
+    // and either nudges the agent to try a different strategy or aborts
+    // with whatever the evidence ledger has accumulated so far. Thresholds
+    // are intentionally conservative — most legitimate retries (e.g.
+    // waiting for an animation) finish in 1-2 attempts.
+    const { RepetitionGuard } = await Promise.resolve(/* import() */).then(__nccwpck_require__.bind(__nccwpck_require__, 7302));
+    const guard = new RepetitionGuard();
+    let pendingGuardAdvice = null;
     let turns = 0;
     let toolCalls = 0;
     let verdict = null;
@@ -44342,6 +44629,45 @@ async function runAgent(input) {
         }
         if (verdict)
             break;
+        // Repetition guard: feed the turn's last tool call to the guard.
+        // We pick the LAST tool_use in the response (the agent often emits a
+        // peek + an action in the same turn; the action is the one that
+        // matters for loop detection). The guard decides whether to nudge
+        // the agent next turn or abort with what we've got.
+        if (trace.length > 0) {
+            const last = trace[trace.length - 1];
+            const inputAny = last.input;
+            const targetId = String(inputAny.elementId ?? inputAny.selector ?? inputAny.path ?? inputAny.text ?? "") || undefined;
+            // We only have a reliable "did the DOM change?" signal at the
+            // turn boundary for the page-state-hash-aware tools. For others
+            // (peek, observe) we default domChanged=false; the stagnation
+            // threshold (8 consecutive no-change turns) absorbs the noise.
+            const domChanged = /Navigated to|state changed|state did change/.test(last.result);
+            const decision = guard.check({
+                tool: last.tool,
+                targetId,
+                domChanged,
+                ok: last.ok
+            });
+            if (decision.kind === "abort_with_partial") {
+                verdict = {
+                    status: "partial_verified",
+                    summary: `Aborted to preserve budget — agent stagnated. ${decision.reason} ` +
+                        `Reporting partial verification with the evidence collected so far.`,
+                    toolCalls,
+                    turns,
+                    trace,
+                    quantitativeObservations
+                };
+                break;
+            }
+            if (decision.kind === "force_strategy_change") {
+                // Buffer the advice so it gets prepended to next turn's user
+                // message. This forces the agent to react to the dead end
+                // before its next decision instead of repeating itself.
+                pendingGuardAdvice = decision.advice;
+            }
+        }
         if (response.stopReason === "end_turn" && toolResults.length === 0) {
             // Agent stopped without calling complete — treat as blocked.
             verdict = {
@@ -44363,10 +44689,17 @@ async function runAgent(input) {
                 passedCriteria,
                 recentTools: trace.map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
             });
-            messages.push({
-                role: "user",
-                content: [...toolResults, { type: "text", text: progressText }]
-            });
+            const content = [...toolResults, { type: "text", text: progressText }];
+            if (pendingGuardAdvice) {
+                // Inject guard advice at the END so it's the LAST thing the
+                // agent reads before deciding the next move — prompt salience.
+                content.push({
+                    type: "text",
+                    text: `\n\n[mint guard] ${pendingGuardAdvice}`
+                });
+                pendingGuardAdvice = null;
+            }
+            messages.push({ role: "user", content });
         }
     }
     return verdict ?? {
@@ -44379,7 +44712,10 @@ async function runAgent(input) {
     };
 }
 
+// EXTERNAL MODULE: ../browser/dist/repetition-guard.js
+var repetition_guard = __nccwpck_require__(7302);
 ;// CONCATENATED MODULE: ../browser/dist/index.js
+
 
 
 
@@ -47365,7 +47701,100 @@ async function uploadMedia(opts) {
     return result.url;
 }
 
+;// CONCATENATED MODULE: ./src/assert-sha.ts
+
+
+/**
+ * Verify the runner is sitting on the PR head, not the workflow's baseRef.
+ *
+ * The Mint server bundles `_mintMeta.prSha` into every mission dispatched
+ * from a pull request. A workflow that doesn't explicitly check out that
+ * SHA stays on whatever ref `actions/checkout@v4` defaulted to — which for
+ * `workflow_dispatch` events is the base branch (typically `main`), not
+ * the PR head. The agent then dutifully reviews the base branch, reports
+ * "the new tab isn't there," and the customer wastes a cycle debugging
+ * code that never ran.
+ *
+ * This guard catches that misconfiguration before a single browser tool
+ * call burns: it compares the current runner HEAD against the expected
+ * prSha and throws an explicit fix-it error if they diverge.
+ *
+ * Missions without `_mintMeta.prSha` (local CLI runs, manual replays,
+ * non-PR dispatches) are left alone — there's nothing to verify against.
+ *
+ * @throws Error when the runner HEAD doesn't match the expected prSha.
+ *         Action.yml's `core.setFailed` path picks this up and stops the
+ *         workflow before any browser work runs.
+ */
+function assertRunningOnExpectedSha(mission, deps = {}) {
+    const meta = mission?._mintMeta;
+    const expectedSha = meta?.prSha;
+    if (!expectedSha) {
+        return;
+    }
+    const getHeadSha = deps.getHeadSha ?? defaultGetHeadSha;
+    const logger = deps.logger ?? defaultLogger;
+    let actualSha;
+    try {
+        actualSha = getHeadSha();
+    }
+    catch (err) {
+        // No git in the runner (extremely unusual for GitHub Actions). Skip
+        // the assertion rather than crash — better to attempt the run than to
+        // bail on something orthogonal.
+        logger.warning(`Mint could not verify the runner is on the PR head SHA: ${err instanceof Error ? err.message : String(err)}. Continuing anyway.`);
+        return;
+    }
+    if (actualSha === expectedSha) {
+        logger.info(`Runner is on PR head ${expectedSha.slice(0, 7)} — proceeding.`);
+        return;
+    }
+    throw new Error(formatShaMismatchError(expectedSha, actualSha, meta));
+}
+function defaultGetHeadSha() {
+    return (0,external_node_child_process_namespaceObject.execSync)("git rev-parse HEAD", { cwd: process.cwd() }).toString().trim();
+}
+const defaultLogger = {
+    info: (msg) => core.info(msg),
+    warning: (msg) => core.warning(msg)
+};
+/**
+ * Multi-line, paste-friendly error body. Exported for tests so we can pin
+ * the exact wording — this message is the primary debugging surface a
+ * customer sees when they hit this guard, so wording regressions matter.
+ */
+function formatShaMismatchError(expectedSha, actualSha, meta) {
+    const expectedShort = expectedSha.slice(0, 7);
+    const actualShort = actualSha.slice(0, 7);
+    const baseRef = meta?.baseRef ?? "the base branch";
+    const prNumber = meta?.prNumber ? `PR #${meta.prNumber}` : "this PR";
+    return [
+        `Mint is about to test the wrong commit — refusing to run.`,
+        ``,
+        `  Expected: ${expectedShort} (head of ${prNumber})`,
+        `  Actual:   ${actualShort} (probably ${baseRef})`,
+        ``,
+        `Your workflow checked out the default ref instead of the PR head SHA. workflow_dispatch events start on ${baseRef} by default, so without an explicit "git checkout <prSha>" step Mint reviews ${baseRef} and any assertion about new code on the PR comes back as a false negative.`,
+        ``,
+        `Fix: add this step to your workflow before "uses: adamgusky/mint-action@v1":`,
+        ``,
+        `    - name: Check out PR head SHA from mission`,
+        `      env:`,
+        `        MINT_API_KEY: \${{ secrets.MINT_API_KEY }}`,
+        `        MISSION_ID: \${{ inputs.mission_id }}`,
+        `      run: |`,
+        `        PR_SHA=$(curl -fsS -H "Authorization: Bearer $MINT_API_KEY" \\`,
+        `          "https://mint-blond-six.vercel.app/api/v1/runs/$MISSION_ID/mission" \\`,
+        `          | jq -r '._mintMeta.prSha // empty')`,
+        `        if [ -n "$PR_SHA" ]; then git fetch origin "$PR_SHA" && git checkout "$PR_SHA"; fi`,
+        ``,
+        `(SHAs in full: expected=${expectedSha}, actual=${actualSha}.)`
+    ].join("\n");
+}
+
 ;// CONCATENATED MODULE: ./src/index.ts
+
+
 
 
 
@@ -47385,6 +47814,14 @@ async function run() {
     const mission = await api.getMission(missionId);
     const flowName = mission.flow?.name ?? mission.flowName ?? "(unnamed)";
     core.info(`Mission: ${flowName} (persona=${mission.persona})`);
+    // Refuse to run if the workflow is on the wrong commit. workflow_dispatch
+    // starts on the base branch by default, so a workflow that doesn't
+    // explicitly check out _mintMeta.prSha will silently test the base ref
+    // instead of the PR head — every assertion against new code is then a
+    // false negative ("the new tab is missing") because the new code isn't
+    // there. Failing loudly here is much friendlier than a green/red verdict
+    // about behavior that wasn't actually evaluated.
+    assertRunningOnExpectedSha(mission);
     // Playwright + browser binaries are installed by the composite wrapper.
     // Server bundles the customer's mint.yml config into the mission so we don't
     // have to fetch anything. Refuse to run without it — the placeholder would
@@ -47393,6 +47830,45 @@ async function run() {
     if (!config) {
         throw new Error("Mission did not include a config block. Server is out of date.");
     }
+    // Preflight: complementary to the SHA check above. The SHA assertion
+    // catches "you're on the base branch"; preflight catches the case
+    // where the SHA looks right but the PR's new code isn't actually
+    // present (partial checkout, build/cache drift, dist/lock mismatch).
+    // Costs zero LLM tokens — a handful of fs reads. When it fails, we
+    // post a structured `code_not_present` verdict directly to the run
+    // and skip the browser entirely.
+    const preflight = await runPreflight(config.preflight?.source_assertions, { cwd: process.cwd() });
+    if (!preflight.passed) {
+        core.error(preflight.summary);
+        const headSha = (() => {
+            try {
+                return (0,external_node_child_process_namespaceObject.execSync)("git rev-parse HEAD", { cwd: process.cwd() }).toString().trim();
+            }
+            catch {
+                return undefined;
+            }
+        })();
+        await api.postComplete(missionId, {
+            status: "code_not_present",
+            evidence: [preflight.summary],
+            consoleErrors: [],
+            networkErrors: [],
+            suggestedFix: "Confirm your workflow checks out _mintMeta.prSha before running mint-action, and that your build pipeline produced the expected files. See .github/workflows/mint-landing.yml in adamgusky/blawgy for a reference.",
+            // New structured fields below; older mint-server versions ignore them.
+            recommendations: [{
+                    kind: "fix_workflow",
+                    summary: "Update your workflow to check out the PR head SHA from _mintMeta before booting your app.",
+                    link: "https://github.com/adamgusky/blawgy/blob/main/.github/workflows/mint-landing.yml"
+                }],
+            testedSha: headSha,
+            verifiedAssertions: preflight.results.map((r) => ({
+                intent: `${r.assertion.file} contains "${r.assertion.contains}"`,
+                result: r.ok ? "ok" : "missing"
+            }))
+        });
+        throw new Error("Preflight failed — code is not present on the runner. Skipping browser.");
+    }
+    core.info(preflight.summary);
     const paths = {
         cwd: process.cwd(),
         configPath: external_node_path_default().join(process.cwd(), "mint.yml"),
