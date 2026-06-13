@@ -36259,9 +36259,14 @@ class RepetitionGuard {
     }
     isStagnated() {
         const N = this.opts.stagnationThreshold;
-        if (this.recent.length < N)
+        // Only count entries that were ACTIONS with a real DOM-change
+        // measurement. Reads (peek/observe), assertions, and fills leave
+        // `domChanged` undefined and are skipped — they don't represent
+        // "the agent tried to move the page and nothing happened."
+        const measured = this.recent.filter((r) => r.domChanged !== undefined);
+        if (measured.length < N)
             return false;
-        return this.recent.slice(-N).every((r) => r.domChanged === false);
+        return measured.slice(-N).every((r) => r.domChanged === false);
     }
     /** The synthetic system message injected into the next agent turn
      *  when force_strategy_change fires. Wording is load-bearing — the
@@ -43771,6 +43776,11 @@ async function runAgent(input) {
                 const inp = b.input ?? {};
                 let resultText = "";
                 let ok = true;
+                // Set by handlers that perform an action on the page (click, fill,
+                // scroll, navigate, press_key). Reads/asserts leave it undefined,
+                // which the repetition guard interprets as "doesn't count toward
+                // stagnation" (because reads have no DOM-change semantics).
+                let domChanged;
                 try {
                     if (name === "navigate") {
                         const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
@@ -43781,7 +43791,8 @@ async function runAgent(input) {
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
                         const after = await pageStateHash(page);
-                        if (stateUnchanged(before, after)) {
+                        domChanged = !stateUnchanged(before, after);
+                        if (!domChanged) {
                             resultText += `\n⚠️ Already on this URL — page didn't change. Don't navigate here again; pick a different next step (click into nav, fill a form, etc.).`;
                         }
                     }
@@ -43877,7 +43888,8 @@ async function runAgent(input) {
                                 await captureScreenshot(page, runDir, steps.length);
                                 await input.onScreenshot?.(steps.length);
                                 const after = await pageStateHash(page);
-                                if (stateUnchanged(before, after)) {
+                                domChanged = !stateUnchanged(before, after);
+                                if (!domChanged) {
                                     // For actionable clicks, an unchanged DOM after 30s most
                                     // likely means the API is still in flight (or the
                                     // response renders into something the hash misses) —
@@ -43927,7 +43939,8 @@ async function runAgent(input) {
                         await captureScreenshot(page, runDir, steps.length);
                         await input.onScreenshot?.(steps.length);
                         const after = await pageStateHash(page);
-                        if (stateUnchanged(before, after)) {
+                        domChanged = !stateUnchanged(before, after);
+                        if (!domChanged) {
                             resultText += `\n⚠️ No observable effect: page unchanged after pressing ${key}. Don't repeat this key — pick a different action.`;
                         }
                     }
@@ -43964,6 +43977,7 @@ async function runAgent(input) {
                         await page.waitForTimeout(450);
                         const afterY = await page.evaluate(() => window.scrollY);
                         const delta = afterY - beforeY;
+                        domChanged = delta !== 0;
                         resultText = delta === 0
                             ? `Scrolled (${amount}) — but scroll position unchanged (already at edge?). Peek to see what's currently in view.`
                             : `Scrolled ${delta > 0 ? "down" : "up"} ${Math.abs(delta)}px (now at y=${afterY}). Peek to see what's now in view.`;
@@ -44212,7 +44226,7 @@ async function runAgent(input) {
                     ok = false;
                     resultText = `Tool ${name} threw: ${err instanceof Error ? err.message : String(err)}`;
                 }
-                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 4000) });
+                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 4000), domChanged });
                 toolResults.push({
                     type: "tool_result",
                     tool_use_id: b.id,
@@ -44232,15 +44246,18 @@ async function runAgent(input) {
             const last = trace[trace.length - 1];
             const inputAny = last.input;
             const targetId = String(inputAny.elementId ?? inputAny.selector ?? inputAny.path ?? inputAny.text ?? "") || undefined;
-            // We only have a reliable "did the DOM change?" signal at the
-            // turn boundary for the page-state-hash-aware tools. For others
-            // (peek, observe) we default domChanged=false; the stagnation
-            // threshold (8 consecutive no-change turns) absorbs the noise.
-            const domChanged = /Navigated to|state changed|state did change/.test(last.result);
+            // Handlers that touch the page set `last.domChanged` from a real
+            // before/after pageStateHash comparison. Reads (peek/observe) and
+            // fills leave it undefined, which the guard's `isStagnated` filter
+            // treats as "not an action — don't count." The previous version
+            // tried to derive this from a regex on the result string, but the
+            // regex almost never matched real result text, so every signup
+            // flow tripped the guard around tool call 8 regardless of whether
+            // it was actually stuck.
             const decision = guard.check({
                 tool: last.tool,
                 targetId,
-                domChanged,
+                domChanged: last.domChanged,
                 ok: last.ok
             });
             if (decision.kind === "abort_with_partial") {
