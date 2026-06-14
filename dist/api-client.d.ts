@@ -87,7 +87,17 @@ export declare class MintApi {
     private key;
     constructor(base: string, key: string);
     private request;
-    getMission(id: string): Promise<Mission>;
+    /**
+     * Fetch the mission, retrying on 202 while the server is still
+     * synthesizing the brief. The server returns 202 with a JSON body of
+     * `{ pending: true }` when the row was inserted with a `_pending: true`
+     * placeholder (optimistic-dispatch path in the webhook). We poll until
+     * the brief is swapped in (200 + mission JSON) or we run out of budget.
+     */
+    getMission(id: string, opts?: {
+        now?: () => number;
+        sleep?: (ms: number) => Promise<void>;
+    }): Promise<Mission>;
     postStep(id: string, body: StepEvent): Promise<{
         ok: true;
     }>;

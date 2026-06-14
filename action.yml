@@ -38,6 +38,12 @@ runs:
       env:
         MINT_API_KEY: ${{ inputs.api-key }}
         MINT_MISSION_ID: ${{ inputs.mission-id }}
+        # MINT_RUN_ID is the substitution token used inside customer-declared
+        # setup commands (e.g. `create_user_command: ./scripts/seed.sh
+        # ${MINT_RUN_ID}@test.com`). The action also uses it to render
+        # `{{run_id}}` inside command templates. Defaults to the mission id
+        # so two parallel runs never collide on a shared test user.
+        MINT_RUN_ID: ${{ inputs.mission-id }}
         MINT_API_BASE: ${{ inputs.api-base }}
       run: |
         export NODE_PATH="${{ github.action_path }}/node_modules"
