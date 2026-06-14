@@ -36192,16 +36192,23 @@ exports.visitAsync = visitAsync;
  * returned action so we don't need to spin up Playwright to verify the
  * guard's behaviour.
  */
-const DEFAULT_OPTS = {
-    identicalThreshold: 3,
-    stagnationThreshold: 8
+const DEFAULT_IDENTICAL = 3;
+const STAGNATION_BY_MODEL = {
+    haiku: 8,
+    sonnet: 10,
+    opus: 12
 };
 class RepetitionGuard {
     recent = [];
     opts;
     forcedStrategyChanges = 0;
     constructor(opts = {}) {
-        this.opts = { ...DEFAULT_OPTS, ...opts };
+        const model = opts.model ?? "opus";
+        this.opts = {
+            identicalThreshold: opts.identicalThreshold ?? DEFAULT_IDENTICAL,
+            stagnationThreshold: opts.stagnationThreshold ?? STAGNATION_BY_MODEL[model],
+            model
+        };
     }
     /**
      * Record the agent's latest tool call and decide whether to let the
@@ -36319,6 +36326,9 @@ class RepetitionGuard {
 /******/ 		return module.exports;
 /******/ 	}
 /******/ 	
+/******/ 	// expose the modules object (__webpack_modules__)
+/******/ 	__nccwpck_require__.m = __webpack_modules__;
+/******/ 	
 /************************************************************************/
 /******/ 	/* webpack/runtime/compat get default export */
 /******/ 	(() => {
@@ -36344,6 +36354,28 @@ class RepetitionGuard {
 /******/ 		};
 /******/ 	})();
 /******/ 	
+/******/ 	/* webpack/runtime/ensure chunk */
+/******/ 	(() => {
+/******/ 		__nccwpck_require__.f = {};
+/******/ 		// This file contains only the entry chunk.
+/******/ 		// The chunk loading function for additional chunks
+/******/ 		__nccwpck_require__.e = (chunkId) => {
+/******/ 			return Promise.all(Object.keys(__nccwpck_require__.f).reduce((promises, key) => {
+/******/ 				__nccwpck_require__.f[key](chunkId, promises);
+/******/ 				return promises;
+/******/ 			}, []));
+/******/ 		};
+/******/ 	})();
+/******/ 	
+/******/ 	/* webpack/runtime/get javascript chunk filename */
+/******/ 	(() => {
+/******/ 		// This function allow to reference async chunks
+/******/ 		__nccwpck_require__.u = (chunkId) => {
+/******/ 			// return url for filenames based on template
+/******/ 			return "" + chunkId + ".index.js";
+/******/ 		};
+/******/ 	})();
+/******/ 	
 /******/ 	/* webpack/runtime/hasOwnProperty shorthand */
 /******/ 	(() => {
 /******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
@@ -36352,6 +36384,48 @@ class RepetitionGuard {
 /******/ 	/* webpack/runtime/compat */
 /******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
+/******/ 	
+/******/ 	/* webpack/runtime/require chunk loading */
+/******/ 	(() => {
+/******/ 		// no baseURI
+/******/ 		
+/******/ 		// object to store loaded chunks
+/******/ 		// "1" means "loaded", otherwise not loaded yet
+/******/ 		var installedChunks = {
+/******/ 			792: 1
+/******/ 		};
+/******/ 		
+/******/ 		// no on chunks loaded
+/******/ 		
+/******/ 		var installChunk = (chunk) => {
+/******/ 			var moreModules = chunk.modules, chunkIds = chunk.ids, runtime = chunk.runtime;
+/******/ 			for(var moduleId in moreModules) {
+/******/ 				if(__nccwpck_require__.o(moreModules, moduleId)) {
+/******/ 					__nccwpck_require__.m[moduleId] = moreModules[moduleId];
+/******/ 				}
+/******/ 			}
+/******/ 			if(runtime) runtime(__nccwpck_require__);
+/******/ 			for(var i = 0; i < chunkIds.length; i++)
+/******/ 				installedChunks[chunkIds[i]] = 1;
+/******/ 		
+/******/ 		};
+/******/ 		
+/******/ 		// require() chunk loading for javascript
+/******/ 		__nccwpck_require__.f.require = (chunkId, promises) => {
+/******/ 			// "1" is the signal for "already loaded"
+/******/ 			if(!installedChunks[chunkId]) {
+/******/ 				if(true) { // all chunks have JS
+/******/ 					installChunk(require("./" + __nccwpck_require__.u(chunkId)));
+/******/ 				} else installedChunks[chunkId] = 1;
+/******/ 			}
+/******/ 		};
+/******/ 		
+/******/ 		// no external install chunk
+/******/ 		
+/******/ 		// no HMR
+/******/ 		
+/******/ 		// no HMR manifest
+/******/ 	})();
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
@@ -41559,6 +41633,7 @@ function smartTruncate(value, max) {
 ;// CONCATENATED MODULE: ../engine/dist/generate-agent-brief.js
 
 
+
 /**
  * Extract cardinal numbers + the noun they modify from the developer's
  * @mint prompt. "see 3 newly scheduled article rows on the dashboard" →
@@ -41790,7 +41865,12 @@ async function generateAgentBriefFromIntent(input) {
             ...brief,
             successCriteria: finalCriteria,
             userPrompt: input.testIntent,
-            userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined
+            userStatedQuantities: userStatedQuantities.length ? userStatedQuantities : undefined,
+            // Stamp the brief with the current peek-format version. The browser
+            // branches on this when picking delta vs full peek layouts; older
+            // recorded traces will lack this field and naturally fall back to
+            // the legacy full-peek path. See packages/browser/src/peek-format.ts.
+            briefVersion: CURRENT_BRIEF_VERSION
         };
     }
     return {
@@ -42283,6 +42363,17 @@ const mintConfigSchema = objectType({
         ]).default("fail_with_recommendation"),
         fallback_assertion: stringType().optional(),
         enable_link: stringType().url().optional()
+    })).default([]),
+    // App-declared slow endpoints. When the agent clicks a control whose
+    // label matches `triggered_by_label_regex`, the click handler injects a
+    // hint into the tool_result telling the agent to call wait_for_progress
+    // with the expected timeout. Without these hints the agent often peeks
+    // immediately after a slow click, sees stale state, and re-clicks (which
+    // is hard-refused by the repeat-click guard, so the run blocks).
+    slow_endpoints: arrayType(objectType({
+        matches_url: stringType(),
+        expected_seconds: numberType().int().min(1).max(900),
+        triggered_by_label_regex: stringType().optional()
     })).default([])
 });
 // Two-step re-export (import-then-export rather than `export { x } from "..."`).
@@ -42294,6 +42385,10 @@ const mintConfigSchema = objectType({
 // correctly. Real failure observed in mint-action v2 dist on the runner.
 
 
+/** Current peek-format version. Stamped on freshly-generated AgentBriefs
+ *  and on mission payloads so consumers (replay, comment renderer) can
+ *  detect old traces and fall back to the legacy format. */
+const dist_CURRENT_BRIEF_VERSION = "v2";
 function resolveMintPaths(options = {}) {
     const cwd = path.resolve(options.cwd ?? process.cwd());
     const configPath = path.resolve(cwd, options.config ?? "mint.yml");
@@ -42821,9 +42916,760 @@ function titleCase(value) {
         .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+;// CONCATENATED MODULE: ../browser/dist/backend-health.js
+const DEFAULT_WINDOW_MS = 30_000;
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "0.0.0.0", "::1"]);
+/** True for http(s)://localhost[:port]/... and 127.0.0.1 / 0.0.0.0 / ::1
+ *  variants — the customer's app under test always boots on one of these
+ *  in CI. Public-internet 5xx (Sentry endpoints, analytics blips) MUST NOT
+ *  trigger an abort — they're noise. */
+function isLocalOrigin(url) {
+    try {
+        const parsed = new URL(url);
+        if (parsed.hostname.startsWith("[") && parsed.hostname.endsWith("]")) {
+            const stripped = parsed.hostname.slice(1, -1);
+            return LOCAL_HOSTS.has(stripped);
+        }
+        return LOCAL_HOSTS.has(parsed.hostname);
+    }
+    catch {
+        return false;
+    }
+}
+function attachBackendHealthMonitor(page, options = {}) {
+    const windowMs = options.windowMs ?? DEFAULT_WINDOW_MS;
+    const now = options.now ?? (() => Date.now());
+    const t0 = now();
+    const failures = [];
+    let detached = false;
+    const inWindow = () => !detached && now() - t0 <= windowMs;
+    const onRequestFailed = (req) => {
+        if (!inWindow())
+            return;
+        const url = req.url();
+        if (!isLocalOrigin(url))
+            return;
+        const failure = req.failure();
+        const text = failure?.errorText ?? "";
+        // ERR_CONNECTION_REFUSED is the canonical "server isn't listening"
+        // signal. We also count ERR_CONNECTION_RESET / ERR_EMPTY_RESPONSE
+        // because in practice they're the same root cause (dev server died
+        // mid-request) and the resulting test run is just as doomed.
+        const isConnRefused = /ERR_CONNECTION_REFUSED|ERR_CONNECTION_RESET|ERR_CONNECTION_CLOSED|ERR_EMPTY_RESPONSE|ECONNREFUSED/i.test(text);
+        if (!isConnRefused)
+            return;
+        failures.push({ url, kind: "connection_refused", errorText: text, at: now() });
+    };
+    const onResponse = (res) => {
+        if (!inWindow())
+            return;
+        const url = res.url();
+        if (!isLocalOrigin(url))
+            return;
+        const status = res.status();
+        if (status < 500)
+            return;
+        failures.push({ url, kind: "server_5xx", status, at: now() });
+    };
+    page.on("requestfailed", onRequestFailed);
+    page.on("response", onResponse);
+    return {
+        count: () => failures.length,
+        recent: () => failures,
+        detach: () => {
+            if (detached)
+                return;
+            detached = true;
+            try {
+                page.off("requestfailed", onRequestFailed);
+            }
+            catch { /* page closed */ }
+            try {
+                page.off("response", onResponse);
+            }
+            catch { /* page closed */ }
+        },
+        isOpen: inWindow
+    };
+}
+/**
+ * Probe the entry URL with a hard 10s timeout. Returns null on success;
+ * returns a structured BackendFailure if the goto threw OR if the
+ * response was 5xx. Callers translate that into a blocked verdict.
+ *
+ * Note we don't `await page.goto` with the agent's normal 30s timeout —
+ * if the customer's app isn't responding at all, waiting 30s just to
+ * say "blocked" wastes runner minutes.
+ */
+async function probeEntryUrl(page, entryUrl, options = {}) {
+    const timeoutMs = options.timeoutMs ?? 10_000;
+    try {
+        const res = await page.goto(entryUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: timeoutMs
+        });
+        if (res && res.status() >= 500) {
+            return {
+                url: entryUrl,
+                kind: "server_5xx",
+                status: res.status(),
+                at: Date.now()
+            };
+        }
+        return null;
+    }
+    catch (err) {
+        return {
+            url: entryUrl,
+            kind: "connection_refused",
+            errorText: err instanceof Error ? err.message : String(err),
+            at: Date.now()
+        };
+    }
+}
+/** Default abort threshold (3 local-origin failures inside the watch
+ *  window). Exported so the agent loop and tests stay in lockstep. */
+const BACKEND_DOWN_THRESHOLD = 3;
+function summarizeFailures(failures) {
+    if (failures.length === 0)
+        return "no failures recorded";
+    const sample = failures
+        .slice(0, 5)
+        .map((f) => f.kind === "server_5xx"
+        ? `${f.status} ${f.url}`
+        : `${f.errorText ?? "connection refused"} ${f.url}`)
+        .join("; ");
+    return `${failures.length} local-origin failure${failures.length === 1 ? "" : "s"}: ${sample}`;
+}
+
+;// CONCATENATED MODULE: ../browser/dist/tour-state.js
+/**
+ * blawg (the dogfood customer) renders a TourOverlay portal at body root
+ * for first-time-user guidance. The overlay covers most assertable UI
+ * (highlights "Click here", dims the rest of the page) which silently
+ * breaks dashboard / blog / settings tests — the agent peeks, sees only
+ * tour-overlay text, fails to find the actual button it should click.
+ *
+ * The overlay reads its dismissal state from localStorage. By default
+ * (no prior session), it shows. So for tests that are obviously about
+ * post-onboarding flows, we pre-seed the dismissal flag via
+ * `addInitScript` BEFORE the entry goto — which means the overlay
+ * never renders for this run.
+ *
+ * Exception: when the test EXPLICITLY targets the tour itself (goal
+ * mentions "tour" / "first time" / "onboarding flow"), we leave the
+ * overlay alone — the tester clearly wants to test it.
+ */
+const TOUR_TARGET_REGEX = /dashboard|blog|settings|onboarding|article/i;
+const TOUR_INTENT_REGEX = /\btour\b|first time|onboarding flow/i;
+const TOUR_STATE_KEY = "blawgy_tour_state";
+function decideTourInjection(input) {
+    const targetMatch = TOUR_TARGET_REGEX.test(input.goal) || TOUR_TARGET_REGEX.test(input.entryUrl);
+    if (!targetMatch) {
+        return { inject: false, reason: "goal/entryUrl does not match tour-prone routes" };
+    }
+    if (TOUR_INTENT_REGEX.test(input.goal)) {
+        return { inject: false, reason: "goal explicitly tests the tour itself — leave it alone" };
+    }
+    return { inject: true, reason: "tour-prone route + non-tour goal — pre-dismiss to avoid overlay covering assertions" };
+}
+/** The script body we run before every page navigation when the
+ *  injection decision says yes. Exported for unit-test assertion. */
+const TOUR_DISMISS_SCRIPT = `localStorage.setItem('${TOUR_STATE_KEY}', JSON.stringify({ completed: true }))`;
+async function maybeInjectDismissedTourState(page, input) {
+    const decision = decideTourInjection(input);
+    if (!decision.inject)
+        return decision;
+    // addInitScript runs on EVERY new document the page loads — so
+    // subsequent agent navigations (eg. /dashboard → /settings) also get
+    // a pre-dismissed tour state. That's the right behavior: the tour
+    // can re-trigger on any route, not just the entry one.
+    await page.addInitScript(TOUR_DISMISS_SCRIPT);
+    return decision;
+}
+
+;// CONCATENATED MODULE: ../browser/dist/peek-format.js
+/**
+ * Peek-format module: renders a `PageSnapshot` as the agent-facing text block
+ * that goes back in the conversation. Two modes:
+ *
+ * 1. **Full** — every section is emitted verbatim (the original behavior).
+ *    Used on the very first peek of a run, when the URL/modal/tab fingerprint
+ *    changes, and for any legacy (v1) replay where pre-existing traces were
+ *    recorded without delta encoding.
+ *
+ * 2. **Delta** — only emit changed/added/removed buttons + links + visible
+ *    text. Mandatory blocks (URL, MODAL, INPUTS, STATUS/ERROR, TABS) are
+ *    ALWAYS re-emitted in full, regardless of whether they changed — they
+ *    are the only place certain disambiguation signals live. (Run #5 hit
+ *    this: agent asserted on the placeholder text "Email" which only
+ *    appears in the INPUTS block; without re-emitting INPUTS every turn,
+ *    the agent went blind to it.)
+ *
+ * Negative-criterion checks need to know what DISAPPEARED, so a "REMOVED
+ * SINCE LAST PEEK" section is always rendered (or omitted entirely when
+ * empty) right after the mandatory sections.
+ *
+ * VISIBLE TEXT also gets a dedup pass: any line that already shows up as a
+ * button/input/link label is dropped (those labels are already in the
+ * structured blocks above; repeating them in VISIBLE TEXT is pure noise).
+ */
+const FORWARD_LABELS = /^(continue|next|submit|generate|save|create|add|publish|confirm|done|finish|proceed)\b/i;
+/** Status/error text we always surface in its own block so the agent sees
+ *  it even when 60+ visible text lines compete for attention. Same set the
+ *  legacy formatter used; centralized here so both paths agree. */
+const STATUS_RE = /\b(not found|failed|fail|invalid|error|incorrect|denied|wrong|cannot|unable|rejected|blocked|forbidden|unauthorized|success|saved|connected|verified)\b/i;
+/**
+ * Render the static "this is what the page looks like" sections (URL,
+ * forward-button warnings, modal, tabs, nav, status text). This block is
+ * ALWAYS emitted verbatim, in both full and delta modes — these signals
+ * are how the agent disambiguates "I'm on the same screen as before" vs
+ * "the page navigated/opened a modal", and they're tiny enough that the
+ * delta savings aren't worth the failure modes.
+ */
+function renderMandatorySections(s) {
+    const lines = [];
+    lines.push(`URL: ${s.url}`);
+    const disabledForwardButtons = s.buttons.filter((b) => !b.enabled && FORWARD_LABELS.test(b.label));
+    if (disabledForwardButtons.length) {
+        const emptyInputs = s.inputs.filter((i) => !i.value).map((i) => `@${i.ref} "${i.label}"`);
+        lines.push("");
+        lines.push(`!! FORWARD BUTTON DISABLED: ${disabledForwardButtons.map((b) => `@${b.ref} "${b.label}"`).join(", ")}`);
+        lines.push(`!! Empty inputs that probably need values: ${emptyInputs.slice(0, 6).join(", ") || "(none visible)"}`);
+        lines.push(`!! Fill them, then peek again.`);
+        lines.push("");
+    }
+    if (s.modal.open) {
+        lines.push(`MODAL OPEN.`);
+        lines.push(`  modal buttons: ${s.modal.buttons.map((b) => `@${b.ref} "${b.label}"${b.enabled ? "" : "[DISABLED]"}`).join(" | ") || "(none)"}`);
+        if (s.modal.inputs.length) {
+            lines.push(`  modal inputs: ${s.modal.inputs.map((i) => `@${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : ""}`).join(" | ")}`);
+        }
+        lines.push(`(Interact with controls INSIDE the modal first, or press Escape to dismiss it.)`);
+    }
+    if (s.tabs.length) {
+        lines.push(`TABS: ${s.tabs.map((t) => `@${t.ref} "${t.label}"${t.selected ? "*" : ""}`).join(" | ")}`);
+    }
+    if (s.nav.length) {
+        lines.push(`NAV: ${s.nav.join(" | ")}`);
+    }
+    return lines;
+}
+/** Always re-emit INPUTS in full. Placeholder text ("Email", "Password",
+ *  "Search by name…") is often the ONLY surface where that text appears
+ *  on the page, and the agent uses it to identify which form it's on. */
+function renderInputs(s) {
+    const lines = [];
+    if (s.inputs.length) {
+        lines.push(`INPUTS (${s.inputs.length}):`);
+        for (const i of s.inputs)
+            lines.push(`  @${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : " (empty)"}`);
+    }
+    return lines;
+}
+/** Surface status/error text in its own header at the top of the visible
+ *  text section — this is usually the assertion target. */
+function renderStatusBlock(s) {
+    const lines = [];
+    if (!s.visibleText.length)
+        return lines;
+    const statusLines = s.visibleText.filter((t) => STATUS_RE.test(t)).slice(0, 10);
+    if (statusLines.length) {
+        lines.push(`⚠️ STATUS/ERROR TEXT ON PAGE:`);
+        for (const t of statusLines)
+            lines.push(`  → "${t}"`);
+    }
+    return lines;
+}
+/** Full-format rendering. Identical output to the original `formatSnapshot`
+ *  in agent-loop.ts so existing replays and the first peek of every run
+ *  produce byte-identical text. */
+function peek_format_renderFullSnapshot(s) {
+    const lines = [];
+    lines.push(...renderMandatorySections(s));
+    lines.push(`BUTTONS (${s.buttons.length}):`);
+    for (const b of s.buttons)
+        lines.push(`  @${b.ref} "${b.label}"${b.enabled ? "" : " [DISABLED]"}`);
+    if (s.links.length) {
+        lines.push(`LINKS (${s.links.length}):`);
+        for (const l of s.links)
+            lines.push(`  @${l.ref} "${l.label}"`);
+    }
+    lines.push(...renderInputs(s));
+    if (s.visibleText.length) {
+        lines.push(...renderStatusBlock(s));
+        lines.push(`VISIBLE TEXT (first 30):`);
+        for (const t of s.visibleText.slice(0, 30))
+            lines.push(`  ${t}`);
+    }
+    return lines.join("\n");
+}
+/**
+ * Decide whether the agent is "on the same screen" as the previous peek.
+ * Cheap fingerprint: URL + modal-open-state + active-tab. Per the spec:
+ *
+ *   "If URL + modal-open-state + tab-state are identical AND the
+ *    structural hash is the same"
+ *
+ * The "structural hash" piece guards against SPA route changes that keep
+ * the URL but swap the entire interactive surface. We use the tabs[]
+ * shape (refs + labels of every tab) as a cheap proxy — when the active
+ * tab is the same AND the tab strip is the same, it's the same screen.
+ *
+ * We intentionally do NOT include exact button/link/input COUNTS: the
+ * whole point of delta encoding is to handle incremental adds/removes
+ * gracefully (e.g. a "Save draft" button appearing, a spinner button
+ * disappearing). If we tripped the fingerprint on every count change,
+ * delta mode would never fire on the cases it's designed for.
+ */
+function fingerprint(s) {
+    const modal = s.modal.open ? "modal:open" : "modal:closed";
+    const activeTab = s.tabs.find((t) => t.selected)?.label ?? "tab:none";
+    // Structural hash: the tab strip's shape. Stable across incremental
+    // button changes; changes when the screen-level layout shifts.
+    const tabStrip = s.tabs.map((t) => `${t.ref}:${t.label}`).join("|");
+    return `${s.url}|${modal}|${activeTab}|${tabStrip}`;
+}
+/** Compute add/remove/relabel deltas between two element lists keyed by ref.
+ *  Refs are reassigned each peek, so identical refs across peeks SHOULD
+ *  point at the same logical element when the structural hash matches. We
+ *  treat label changes as relabels (helps the agent spot "Sign up → Signing
+ *  up…" spinner transitions); pure relabel-only buttons stay in the
+ *  unchanged count to keep the "n unchanged" tally honest. */
+function diffElements(prev, next) {
+    const prevByRef = new Map(prev.map((e) => [e.ref, e]));
+    const nextByRef = new Map(next.map((e) => [e.ref, e]));
+    const added = [];
+    const removed = [];
+    const relabeled = [];
+    for (const e of next) {
+        const prior = prevByRef.get(e.ref);
+        if (!prior) {
+            added.push(e);
+        }
+        else if (prior.label !== e.label) {
+            relabeled.push({ ref: e.ref, from: prior.label, to: e.label });
+        }
+    }
+    for (const e of prev) {
+        if (!nextByRef.has(e.ref))
+            removed.push(e);
+    }
+    const changedRefs = new Set([
+        ...added.map((e) => e.ref),
+        ...relabeled.map((r) => r.ref)
+    ]);
+    const unchangedRefs = next.filter((e) => !changedRefs.has(e.ref)).map((e) => e.ref);
+    return { added, removed, relabeled, unchangedCount: unchangedRefs.length, refs: unchangedRefs };
+}
+function refSpan(refs) {
+    if (!refs.length)
+        return "(none)";
+    // Refs are sequential `e1`, `e2`, … so first + last is a reasonable
+    // "range". Don't try to detect gaps — the agent only needs to know
+    // roughly which refs are still around.
+    return `@${refs[0]}-@${refs[refs.length - 1]}`;
+}
+function renderButtonDelta(label, delta, prevN) {
+    const lines = [];
+    const noChange = delta.added.length === 0 && delta.removed.length === 0 && delta.relabeled.length === 0;
+    if (noChange) {
+        lines.push(`${label}: unchanged (${delta.unchangedCount} items, refs ${refSpan(delta.refs)})`);
+        return lines;
+    }
+    lines.push(`${label} (delta from prior peek):`);
+    for (const e of delta.added)
+        lines.push(`  + new ${label === "BUTTONS" ? "button" : "link"} "${e.label}" @${e.ref}${"enabled" in e && !e.enabled ? " [DISABLED]" : ""}`);
+    for (const e of delta.removed)
+        lines.push(`  - removed ${label === "BUTTONS" ? "button" : "link"} "${e.label}" @${e.ref}`);
+    for (const r of delta.relabeled)
+        lines.push(`  ~ relabeled @${r.ref}: "${r.from}" -> "${r.to}"`);
+    lines.push(`  (unchanged: ${delta.unchangedCount} ${label.toLowerCase()}, refs ${refSpan(delta.refs)})`);
+    // Note prior length when the prior peek had a different count — helps
+    // the agent realize the structural shape shifted.
+    if (delta.unchangedCount + delta.added.length !== prevN + delta.added.length - delta.removed.length) {
+        // Sanity check (shouldn't normally fire). Skip noisy assertion line.
+    }
+    return lines;
+}
+/**
+ * Drop visible-text lines that are already covered by a button/input/link
+ * label (case-insensitive, exact match). Many design systems render a
+ * button whose text ALSO shows up as a separate visible text node (icon +
+ * label, custom render trees). The duplicate eats tokens for no signal.
+ *
+ * Lines NOT covered by a labeled element are always preserved — these are
+ * the bare text nodes that carry messaging the agent can't get elsewhere
+ * (error toasts, body copy, help text, etc).
+ */
+function dedupVisibleText(visibleText, snap) {
+    const labeled = new Set();
+    for (const b of snap.buttons)
+        labeled.add(b.label.trim().toLowerCase());
+    for (const l of snap.links)
+        labeled.add(l.label.trim().toLowerCase());
+    for (const i of snap.inputs)
+        labeled.add(i.label.trim().toLowerCase());
+    for (const t of snap.tabs)
+        labeled.add(t.label.trim().toLowerCase());
+    for (const b of snap.modal.buttons)
+        labeled.add(b.label.trim().toLowerCase());
+    for (const i of snap.modal.inputs)
+        labeled.add(i.label.trim().toLowerCase());
+    return visibleText.filter((t) => !labeled.has(t.trim().toLowerCase()));
+}
+function renderVisibleTextDelta(snap, prev) {
+    const lines = [];
+    if (!snap.visibleText.length)
+        return lines;
+    const deduped = dedupVisibleText(snap.visibleText, snap);
+    const prevDeduped = dedupVisibleText(prev.visibleText, prev);
+    const prevSet = new Set(prevDeduped);
+    const nextSet = new Set(deduped);
+    const added = deduped.filter((t) => !prevSet.has(t));
+    const removed = prevDeduped.filter((t) => !nextSet.has(t));
+    if (added.length === 0 && removed.length === 0) {
+        lines.push(`VISIBLE TEXT: unchanged (${deduped.length} lines after dedup)`);
+        return lines;
+    }
+    lines.push(`VISIBLE TEXT (delta from prior peek):`);
+    for (const t of added.slice(0, 30))
+        lines.push(`  + "${t}"`);
+    if (added.length > 30)
+        lines.push(`  + …(${added.length - 30} more added)`);
+    // Removed visible text isn't listed here — it shows up in REMOVED SINCE
+    // LAST PEEK along with removed elements. Keeping it in one place avoids
+    // duplicating the negative-evidence signal.
+    const unchangedDeduped = deduped.filter((t) => prevSet.has(t));
+    if (unchangedDeduped.length) {
+        lines.push(`  (unchanged: ${unchangedDeduped.length} lines)`);
+    }
+    return lines;
+}
+function renderRemovedSection(buttonsDelta, linksDelta, prev, next) {
+    const lines = [];
+    const removedTexts = [];
+    const prevDeduped = dedupVisibleText(prev.visibleText, prev);
+    const nextSet = new Set(dedupVisibleText(next.visibleText, next));
+    for (const t of prevDeduped) {
+        if (!nextSet.has(t))
+            removedTexts.push(t);
+    }
+    if (buttonsDelta.removed.length === 0 && linksDelta.removed.length === 0 && removedTexts.length === 0) {
+        return lines;
+    }
+    lines.push(`REMOVED SINCE LAST PEEK:`);
+    for (const b of buttonsDelta.removed)
+        lines.push(`  - button "${b.label}" @${b.ref}`);
+    for (const l of linksDelta.removed)
+        lines.push(`  - link "${l.label}" @${l.ref}`);
+    for (const t of removedTexts.slice(0, 20))
+        lines.push(`  - text "${t}"`);
+    if (removedTexts.length > 20)
+        lines.push(`  - …(${removedTexts.length - 20} more text lines removed)`);
+    return lines;
+}
+/**
+ * Top-level entry. Picks delta vs full, applies the chosen layout, and
+ * returns the rendered text alongside the per-peek byte-savings metric.
+ */
+function formatPeek(snap, prev, options = {}) {
+    const baselineText = peek_format_renderFullSnapshot(snap);
+    const baselineBytes = Buffer.byteLength(baselineText, "utf8");
+    // First peek of a run → no prior to diff against. Legacy mode → don't
+    // delta-encode (the recorded trace assumes the FULL layout). Fingerprint
+    // mismatch → page has structurally changed; full layout is safer than
+    // a confusing partial diff.
+    if (!prev || options.legacy || fingerprint(snap) !== fingerprint(prev)) {
+        return {
+            text: baselineText,
+            baselineBytes,
+            deltaBytes: baselineBytes,
+            savedBytes: 0,
+            compressionRatio: 1,
+            usedDelta: false
+        };
+    }
+    const buttonsDelta = diffElements(prev.buttons, snap.buttons);
+    const linksDelta = diffElements(prev.links, snap.links);
+    const lines = [];
+    lines.push(...renderMandatorySections(snap));
+    lines.push(...renderButtonDelta("BUTTONS", buttonsDelta, prev.buttons.length));
+    if (snap.links.length || prev.links.length) {
+        lines.push(...renderButtonDelta("LINKS", linksDelta, prev.links.length));
+    }
+    lines.push(...renderInputs(snap));
+    lines.push(...renderStatusBlock(snap));
+    lines.push(...renderVisibleTextDelta(snap, prev));
+    lines.push(...renderRemovedSection(buttonsDelta, linksDelta, prev, snap));
+    const text = lines.join("\n");
+    const deltaBytes = Buffer.byteLength(text, "utf8");
+    const savedBytes = baselineBytes - deltaBytes;
+    const compressionRatio = baselineBytes === 0 ? 1 : deltaBytes / baselineBytes;
+    return { text, baselineBytes, deltaBytes, savedBytes, compressionRatio, usedDelta: true };
+}
+
+;// CONCATENATED MODULE: ../browser/dist/peek-visual-strip.js
+/**
+ * Strip stale peek_visual screenshots from a conversation transcript.
+ *
+ * `peek_visual` returns the page snapshot text + a base64 PNG. Both pieces
+ * stay in the `messages` array forever and get re-sent on every subsequent
+ * turn — a 70-100KB image embedded in the cache-eligible prefix means
+ * we're paying full input-token price for outdated visual evidence the
+ * agent already moved past.
+ *
+ * Fix: walk the message history and replace EVERY image block belonging
+ * to an OLDER `peek_visual` with a tiny text marker, leaving only the
+ * most recent visual intact. The agent's reasoning over previous visuals
+ * is preserved (the snapshot text stays); only the PNG bytes get stripped.
+ *
+ * Image blocks live inside `tool_result.content` arrays, which themselves
+ * live inside user messages (the runner appends one user message per
+ * turn carrying the tool_results from the previous assistant turn).
+ */
+/** True if a block is a base64 image we'd like to strip on older turns. */
+function isImageBlock(b) {
+    if (!b || typeof b !== "object")
+        return false;
+    const rec = b;
+    return rec.type === "image";
+}
+/** True if a content entry is a tool_result whose content array contains
+ *  at least one image block. */
+function hasImagePayload(block) {
+    if (!block || typeof block !== "object")
+        return false;
+    const rec = block;
+    if (rec.type !== "tool_result")
+        return false;
+    if (!Array.isArray(rec.content))
+        return false;
+    return rec.content.some(isImageBlock);
+}
+/**
+ * Returns a new messages array with all image blocks stripped EXCEPT for
+ * the image attached to the most recent `tool_result` that contains one.
+ *
+ * Each stripped image is replaced by a `{type: "text"}` marker. The
+ * marker references the turn index so the agent's chain of reasoning
+ * still has a breadcrumb pointing back to the captured screenshot in
+ * the run directory.
+ *
+ * Pure function — does not mutate `messages`. Safe to call right before
+ * the agent caller every turn.
+ */
+function stripStalePeekVisuals(messages) {
+    // Find the LAST message containing an image-bearing tool_result. Anything
+    // before that index gets stripped; the one image at/after stays.
+    let lastImageTurnIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const content = messages[i].content;
+        if (Array.isArray(content) && content.some(hasImagePayload)) {
+            lastImageTurnIdx = i;
+            break;
+        }
+    }
+    // No images anywhere → return as-is. Avoids the array spread cost.
+    if (lastImageTurnIdx === -1)
+        return messages;
+    return messages.map((msg, turnIdx) => {
+        if (turnIdx === lastImageTurnIdx)
+            return msg; // keep latest
+        if (!Array.isArray(msg.content))
+            return msg;
+        // Fast path: skip entire message if none of its blocks contain an
+        // image. Preserving referential identity keeps the diff visible to
+        // downstream consumers (and the tests below assert it).
+        const contentArr = msg.content;
+        if (!contentArr.some(hasImagePayload))
+            return msg;
+        const stripped = contentArr.map((block) => {
+            if (!hasImagePayload(block))
+                return block;
+            const tr = block;
+            // Tool_result.content can technically be a string, but hasImagePayload
+            // already verified it's an array. The map below rewrites image blocks
+            // → text markers and leaves text blocks untouched.
+            const newContent = tr.content.map((b) => {
+                if (isImageBlock(b)) {
+                    return {
+                        type: "text",
+                        text: `[visual snapshot at turn ${turnIdx + 1} — replaced; see step ${turnIdx + 1} for visual evidence]`
+                    };
+                }
+                return b;
+            });
+            return { ...tr, content: newContent };
+        });
+        return { ...msg, content: stripped };
+    });
+}
+
 ;// CONCATENATED MODULE: ../browser/dist/agent-loop.js
 
 
+
+
+
+
+/** Word-set Jaccard, case-insensitive. Splits on any non-word run.
+ *  Empty inputs → 0 (no similarity). */
+function jaccardWordSimilarity(a, b) {
+    const toSet = (s) => {
+        const words = s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length > 0);
+        return new Set(words);
+    };
+    const A = toSet(a);
+    const B = toSet(b);
+    if (A.size === 0 || B.size === 0)
+        return 0;
+    let intersection = 0;
+    for (const w of A)
+        if (B.has(w))
+            intersection++;
+    const union = A.size + B.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+/** A trace entry is a "positive observation source" if and only if it
+ *  comes from a tool that affirmatively reports on-page state:
+ *    - peek / peek_visual: always (peeks can't fail; they snapshot the
+ *      DOM as observed)
+ *    - assert_visible: only when ok=true (found-true text was actually
+ *      visible on the page)
+ *  Explicitly NOT positive: assert_visible(ok=false), count_check (use
+ *  its auto-DONE marking instead), every other tool's text, refusals,
+ *  errors. */
+function isPositiveObservationSource(entry) {
+    if (entry.tool === "peek" || entry.tool === "peek_visual")
+        return true;
+    if (entry.tool === "assert_visible" && entry.ok === true)
+        return true;
+    return false;
+}
+/** The Jaccard threshold above which a quote is rejected as "echoing the
+ *  criterion back". 0.5 is the spec-required value. */
+const JACCARD_REJECT_THRESHOLD = 0.5;
+/** Max attestations per complete() call. Excess entries are auto-rejected
+ *  with reason=cap. Spec-required value: 1. */
+const MAX_ATTESTATIONS_PER_COMPLETE = 1;
+/** Window of recent trace entries scanned for quote provenance. The
+ *  previous gate used the last 3 tool_results too — kept identical so
+ *  legitimate attestations from a recent peek still validate. */
+const PROVENANCE_WINDOW = 3;
+/**
+ * Validate one batch of `criteria_evidence` from a complete() call.
+ *
+ * Behavior is purely functional — no side effects, no logging. The
+ * caller is responsible for:
+ *   - Emitting telemetry for each rejection (`console.log` line).
+ *   - Marking accepted criteria as DONE on the live progress tracker.
+ *   - Refusing the complete() call (ok=false) when `rejected.length > 0`.
+ *
+ * Exported for unit testing.
+ */
+function validateAttestation(input) {
+    const accepted = [];
+    const rejected = [];
+    // Provenance window: take the last 3 trace entries, keep only the ones
+    // sourced from positive observations. Quote substring search runs
+    // ONLY against the resulting concatenation — assert(found=false),
+    // count_check, refusals, errors, and timeouts are excluded by
+    // construction.
+    const recentPositiveResults = input.trace
+        .slice(-PROVENANCE_WINDOW)
+        .filter(isPositiveObservationSource)
+        .map((t) => String(t.result ?? ""))
+        .join("\n")
+        .toLowerCase();
+    for (let i = 0; i < input.evidence.length; i++) {
+        const e = input.evidence[i];
+        const rawIndex = Number(e?.criterion_index ?? 0);
+        const idx0 = rawIndex - 1; // criterion_index is 1-based
+        const quote = String(e?.observation_quote ?? "").trim();
+        const quotePreview = quote.slice(0, 60);
+        // Cap: only the first MAX_ATTESTATIONS_PER_COMPLETE entries are
+        // eligible for validation; the rest are auto-rejected regardless of
+        // content. This stops the agent from carpet-bombing the gate with
+        // synonyms hoping one sticks.
+        if (i >= MAX_ATTESTATIONS_PER_COMPLETE) {
+            rejected.push({
+                criterionIndex: Number.isFinite(rawIndex) ? rawIndex : null,
+                reason: "cap",
+                message: `Rejected criterion ${rawIndex || "?"}: at most ${MAX_ATTESTATIONS_PER_COMPLETE} attestation is allowed per complete() call. Remaining criteria must be verified through assert_visible (positive) or count_check (quantity), which auto-mark them DONE. Resubmit complete() with only your single most-important attestation; verify the rest with the proper tools first.`,
+                quotePreview
+            });
+            continue;
+        }
+        // Range check: criterion_index must point at a real criterion.
+        if (!Number.isFinite(rawIndex) || idx0 < 0 || idx0 >= input.successCriteria.length) {
+            rejected.push({
+                criterionIndex: Number.isFinite(rawIndex) ? rawIndex : null,
+                reason: "range",
+                message: `Rejected: criterion_index ${e?.criterion_index} out of range (must be 1..${input.successCriteria.length}).`,
+                quotePreview
+            });
+            continue;
+        }
+        // Length check: keep the historical floor — < 15 chars is too easy
+        // to satisfy from incidental UI chrome.
+        if (quote.length < 15) {
+            rejected.push({
+                criterionIndex: rawIndex,
+                reason: "length",
+                message: `Rejected criterion ${rawIndex}: observation_quote must be ≥15 chars (got ${quote.length}). Quote a longer, more specific verbatim string from a recent peek or successful assert_visible.`,
+                quotePreview
+            });
+            continue;
+        }
+        const crit = input.successCriteria[idx0];
+        // Lock check: wait_for_progress timeouts lock criteria so the agent
+        // can't claim them based on stale pre-action peek text. Reject
+        // attestations against locked criteria with a hint to re-verify
+        // via a fresh peek + assert_visible.
+        if (input.isLocked?.(rawIndex)) {
+            rejected.push({
+                criterionIndex: rawIndex,
+                reason: "locked",
+                message: `Rejected criterion ${rawIndex}: a wait_for_progress targeting this criterion timed out, so any quote you have is from a pre-wait snapshot and can't be trusted. Call peek to capture fresh state, then assert_visible against the actual end-state text. Only retry attestation if the page now shows the expected outcome.`,
+                quotePreview
+            });
+            continue;
+        }
+        // Already DONE via the stronger auto-marking pathway — accepting
+        // this attestation would be a no-op. Treat as a silent skip rather
+        // than reject: not an integrity failure, just redundant.
+        if (input.alreadyPassedCriteria.has(crit)) {
+            continue;
+        }
+        // Anti-self-quoting: word-set Jaccard with the criterion text. The
+        // agent shouldn't be able to copy the criterion (or close paraphrase)
+        // into the quote field — that proves nothing about the page state.
+        const similarity = jaccardWordSimilarity(quote, crit);
+        if (similarity > JACCARD_REJECT_THRESHOLD) {
+            rejected.push({
+                criterionIndex: rawIndex,
+                reason: "jaccard",
+                message: `Rejected criterion ${rawIndex}: observation_quote is too similar to the criterion text itself (word-set Jaccard ${similarity.toFixed(2)} > ${JACCARD_REJECT_THRESHOLD}). Quote a SPECIFIC verbatim string from the page (a heading, a status badge, a row's date/label) — not the criterion's own wording. Try calling assert_visible against the literal end-state, or peek and quote distinctive on-page text.`,
+                quotePreview
+            });
+            continue;
+        }
+        // Provenance: the quote must appear (case-insensitive substring) in
+        // the concatenation of recent positive-observation results.
+        if (!recentPositiveResults.includes(quote.toLowerCase())) {
+            rejected.push({
+                criterionIndex: rawIndex,
+                reason: "provenance",
+                message: `Rejected criterion ${rawIndex}: observation_quote "${quotePreview}${quote.length > 60 ? "…" : ""}" was not found in any recent positive observation (peek or assert_visible with found=true) in the last ${PROVENANCE_WINDOW} tool calls. Reading from your OWN assert-failed text, count_check output, tool refusals, or error messages does not count as evidence. Call assert_visible(text="<distinctive end-state text>") OR count_check(text=…, minCount=…) against the criterion's target, then retry.`,
+                quotePreview
+            });
+            continue;
+        }
+        accepted.push({ criterionIndex: rawIndex, criterion: crit, quote });
+    }
+    return { accepted, rejected };
+}
 const AGENT_TOOLS = [
     {
         name: "navigate",
@@ -42946,6 +43792,41 @@ const AGENT_TOOLS = [
         }
     },
     {
+        name: "wait_for_progress",
+        description: "Wait for the page to progress after triggering an async action (form submit, API call). Polls the DOM hash + network. Use this instead of re-peeking when you've clicked a button that triggers backend work. The page will be considered 'progressed' if DOM changes meaningfully OR a specified text appears/disappears. Returns when progressed or after timeout. NOTE: a timeout here LOCKS the related criterion against attestation — if you wait_for_progress to verify 'job completed' and it times out, you can no longer call complete(passed) on that criterion via attestation. Use only after a real triggering action.",
+        input_schema: {
+            type: "object",
+            properties: {
+                reason: { type: "string", description: "What you're waiting for and why. Used to associate the wait with a success criterion for attestation-lock purposes — make it specific (e.g. 'waiting for site connection to verify')." },
+                timeoutSec: { type: "number", description: "Max seconds to wait (default 15, max 120).", default: 15 },
+                until: {
+                    description: "Condition that ends the wait. Defaults to dom_change.",
+                    oneOf: [
+                        { type: "object", properties: { kind: { type: "string", enum: ["dom_change"] } }, required: ["kind"] },
+                        { type: "object", properties: { kind: { type: "string", enum: ["text_appears"] }, text: { type: "string" } }, required: ["kind", "text"] },
+                        { type: "object", properties: { kind: { type: "string", enum: ["text_disappears"] }, text: { type: "string" } }, required: ["kind", "text"] },
+                        { type: "object", properties: { kind: { type: "string", enum: ["network_idle"] }, idleMs: { type: "number" } }, required: ["kind"] },
+                        { type: "object", properties: { kind: { type: "string", enum: ["selector_appears"] }, selector: { type: "string" } }, required: ["kind", "selector"] }
+                    ]
+                }
+            },
+            required: ["reason"]
+        }
+    },
+    {
+        name: "wait_for_dom_stable",
+        description: "Wait for the DOM to settle (no changes for N ms). Use when an animation or progressive rendering is in progress and you need to wait for it to finish before interacting. Doesn't block on network; purely watches the DOM hash. Cheap and quick — defaults to quietMs=1500, timeoutSec=10.",
+        input_schema: {
+            type: "object",
+            properties: {
+                reason: { type: "string" },
+                quietMs: { type: "number", default: 1500 },
+                timeoutSec: { type: "number", default: 10 }
+            },
+            required: ["reason"]
+        }
+    },
+    {
         name: "complete",
         description: "Signal the test is over. Use 'passed' only if every success criterion is verifiably satisfied. Use 'failed' if you're confident the feature is broken (cite the evidence). Use 'blocked' if you couldn't proceed (e.g., env issue, auth wall, missing fixture). If passed is refused because a criterion looks pending but you've actually verified it (semantic overlap the matcher missed), retry with criteria_evidence: each entry must include the criterion's index AND a verbatim quote (≥15 chars) from your most recent peek or assert result. The system validates the quote against your recorded observations.",
         input_schema: {
@@ -43044,12 +43925,17 @@ ${recent.map((t, i) => {
     return `=== CONTEXT UPDATE ===\nCRITERIA STATUS:\n${criteriaWithStatus}${recentTrace}\n=== END CONTEXT ===`;
 }
 function agent_loop_absoluteUrl(baseUrl, pathOrUrl) {
-    if (/^https?:\/\//i.test(pathOrUrl))
+    // Already-absolute URLs (http/https for real apps; data:/file: in tests)
+    // pass through untouched — concatenating the base would corrupt them.
+    if (/^(https?|data|file|blob):/i.test(pathOrUrl))
         return pathOrUrl;
     const base = baseUrl.replace(/\/$/, "");
     const tail = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
     return base + tail;
 }
+// PageSnapshot, SnapshotEl, and SnapshotInputEl are now defined in
+// peek-format.ts so the formatter can share them with the rest of the
+// loop. They're re-exported via the imports at the top of this file.
 /**
  * Refs + tagging: every interactive element gets a stable handle (`@e1`,
  * `@e2`, …) that the agent can pass back to click/fill instead of a fuzzy
@@ -43066,11 +43952,97 @@ async function snapshotPage(page) {
         // Wipe any refs left over from a prior peek. Snapshots are point-in-time
         // and refs from two turns ago aren't valid anymore.
         document.querySelectorAll("[data-mint-ref]").forEach((el) => el.removeAttribute("data-mint-ref"));
+        // NOTE: data-mint-stable is intentionally NOT wiped. The ID is derived
+        // from the element's structural identity (role + text + ancestor path +
+        // nth-among-siblings) — it's stable across snapshots within a page
+        // lifetime. We only let it churn on full navigations, which we handle
+        // implicitly because the new page never sets these attributes.
         let refCounter = 0;
         const assignRef = (el) => {
             const ref = `e${++refCounter}`;
             el.setAttribute("data-mint-ref", ref);
+            // Stamp the durable stable ID on the same element. We call this from
+            // assignRef (not inline at each capture loop) so the snapshotter and
+            // replay resolver agree on which elements get stable IDs — namely,
+            // every element the agent could possibly target.
+            assignStableId(el);
             return ref;
+        };
+        // Lightweight role inference for cases where the element doesn't carry
+        // an explicit role attribute. Mirrors the well-known ARIA implicit roles
+        // for the tags we actually capture.
+        const roleOf = (el) => {
+            const explicit = el.getAttribute("role");
+            if (explicit)
+                return explicit;
+            const tag = el.tagName.toLowerCase();
+            if (tag === "a")
+                return "link";
+            if (tag === "button")
+                return "button";
+            if (tag === "input") {
+                const type = el.type;
+                if (type === "submit")
+                    return "button";
+                if (type === "checkbox")
+                    return "checkbox";
+                if (type === "radio")
+                    return "radio";
+                return "textbox";
+            }
+            if (tag === "textarea")
+                return "textbox";
+            if (tag === "select")
+                return "combobox";
+            return tag;
+        };
+        // 8-char djb2 hash, returned as hex. Stable IDs are derived from
+        // structural properties so two snapshots of the same page produce the
+        // same stableId for the same element even across re-renders.
+        const stableHash = (s) => {
+            let h = 5381;
+            for (let i = 0; i < s.length; i++)
+                h = ((h << 5) + h) ^ s.charCodeAt(i);
+            return (h >>> 0).toString(16).padStart(8, "0").slice(0, 8);
+        };
+        // Compute and assign a stable structural ID to an interactive element.
+        // Inputs: 3-hop ancestor role path + role + normalized text + nth among
+        // siblings of the same role. Returns the assigned ID so the snapshot
+        // formatter can include it in the trace's rich target capture.
+        const assignStableId = (el) => {
+            // Skip if already assigned this run — the per-element hash is
+            // deterministic, so re-running the function on the same element would
+            // give the same value, but the attribute already being there means
+            // we computed it during a prior snapshot and trust it.
+            const existing = el.getAttribute("data-mint-stable");
+            if (existing)
+                return existing;
+            const role = roleOf(el);
+            const text = (el.textContent || el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim().slice(0, 60).toLowerCase();
+            const ancestors = [];
+            let cur = el.parentElement;
+            let hops = 0;
+            while (cur && hops < 4) {
+                const r = cur.getAttribute("role");
+                const semHints = ["NAV", "MAIN", "ASIDE", "HEADER", "FOOTER", "FORM", "DIALOG", "SECTION", "ARTICLE", "UL", "OL", "LI", "TABLE", "TR"];
+                if (r || semHints.includes(cur.tagName.toUpperCase())) {
+                    ancestors.push((r ?? cur.tagName).toLowerCase());
+                }
+                cur = cur.parentElement;
+                hops++;
+            }
+            // Position among siblings sharing the same role — disambiguates two
+            // "Edit" buttons in the same list.
+            let nth = 0;
+            let sib = el.previousElementSibling;
+            while (sib) {
+                if (roleOf(sib) === role)
+                    nth++;
+                sib = sib.previousElementSibling;
+            }
+            const id = stableHash(`${ancestors.join(">")}|${role}|${text}|${nth}`);
+            el.setAttribute("data-mint-stable", id);
+            return id;
         };
         const seen = new WeakSet();
         const visible = (el) => {
@@ -43225,64 +44197,17 @@ async function snapshotPage(page) {
         };
     });
 }
+/**
+ * Full-snapshot formatter — delegates to the shared `renderFullSnapshot`
+ * in `peek-format.ts` so the legacy path and the v2 delta path agree on
+ * how the FULL layout looks. v2 peeks go through `formatPeekDelta` (which
+ * also exposes byte-saved telemetry).
+ *
+ * Kept as a thin wrapper so existing call sites + replays that always
+ * want the full text don't need to know about the new module.
+ */
 function formatSnapshot(s) {
-    const lines = [];
-    lines.push(`URL: ${s.url}`);
-    const forwardLabels = /^(continue|next|submit|generate|save|create|add|publish|confirm|done|finish|proceed)\b/i;
-    const disabledForwardButtons = s.buttons.filter((b) => !b.enabled && forwardLabels.test(b.label));
-    if (disabledForwardButtons.length) {
-        const emptyInputs = s.inputs.filter((i) => !i.value).map((i) => `@${i.ref} "${i.label}"`);
-        lines.push("");
-        lines.push(`!! FORWARD BUTTON DISABLED: ${disabledForwardButtons.map((b) => `@${b.ref} "${b.label}"`).join(", ")}`);
-        lines.push(`!! Empty inputs that probably need values: ${emptyInputs.slice(0, 6).join(", ") || "(none visible)"}`);
-        lines.push(`!! Fill them, then peek again.`);
-        lines.push("");
-    }
-    if (s.modal.open) {
-        lines.push(`MODAL OPEN.`);
-        lines.push(`  modal buttons: ${s.modal.buttons.map((b) => `@${b.ref} "${b.label}"${b.enabled ? "" : "[DISABLED]"}`).join(" | ") || "(none)"}`);
-        if (s.modal.inputs.length) {
-            lines.push(`  modal inputs: ${s.modal.inputs.map((i) => `@${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : ""}`).join(" | ")}`);
-        }
-        lines.push(`(Interact with controls INSIDE the modal first, or press Escape to dismiss it.)`);
-    }
-    if (s.tabs.length) {
-        lines.push(`TABS: ${s.tabs.map((t) => `@${t.ref} "${t.label}"${t.selected ? "*" : ""}`).join(" | ")}`);
-    }
-    if (s.nav.length) {
-        lines.push(`NAV: ${s.nav.join(" | ")}`);
-    }
-    // Compact ref-first format. Refs are stable handles you can pass back to
-    // click/fill — much cheaper than fuzzy label matching, and they won't
-    // collide when two controls share the same text.
-    lines.push(`BUTTONS (${s.buttons.length}):`);
-    for (const b of s.buttons)
-        lines.push(`  @${b.ref} "${b.label}"${b.enabled ? "" : " [DISABLED]"}`);
-    if (s.links.length) {
-        lines.push(`LINKS (${s.links.length}):`);
-        for (const l of s.links)
-            lines.push(`  @${l.ref} "${l.label}"`);
-    }
-    if (s.inputs.length) {
-        lines.push(`INPUTS (${s.inputs.length}):`);
-        for (const i of s.inputs)
-            lines.push(`  @${i.ref} "${i.label}"${i.value ? ` (cur: "${i.value}")` : " (empty)"}`);
-    }
-    if (s.visibleText.length) {
-        // Highlight status/error/success cues at the top — these are usually
-        // the verification signal the agent is looking for.
-        const STATUS_RE = /\b(not found|failed|fail|invalid|error|incorrect|denied|wrong|cannot|unable|rejected|blocked|forbidden|unauthorized|success|saved|connected|verified)\b/i;
-        const statusLines = s.visibleText.filter((t) => STATUS_RE.test(t)).slice(0, 10);
-        if (statusLines.length) {
-            lines.push(`⚠️ STATUS/ERROR TEXT ON PAGE:`);
-            for (const t of statusLines)
-                lines.push(`  → "${t}"`);
-        }
-        lines.push(`VISIBLE TEXT (first 30):`);
-        for (const t of s.visibleText.slice(0, 30))
-            lines.push(`  ${t}`);
-    }
-    return lines.join("\n");
+    return renderFullSnapshot(s);
 }
 function pickElementHandle(page, label, kind) {
     const safe = label.replace(/"/g, '\\"');
@@ -43408,6 +44333,167 @@ async function clickByLabel(page, label, kind, options = {}) {
     }
     return { ok: false, detail: `No clickable element found matching "${label}" (tried button/link/tab/text-match). Peek the page to see what's actually visible.` };
 }
+/** Snapshot a rich descriptor of the element targeted by a click/fill.
+ *  Used to populate the `target` field on the recorded trace so replay can
+ *  resolve via testid → stableId → role+name → text → ref instead of relying
+ *  on per-snapshot refs that drift between runs.
+ *
+ *  Best-effort: returns undefined when the ref isn't on the DOM (e.g. the
+ *  page navigated between peek and the action). Callers should `.catch(() =>
+ *  undefined)` so a missing rich target never breaks the recording. */
+async function captureRichTarget(page, ref, labelFallback) {
+    const cleanRef = ref.replace(/^@/, "");
+    const selector = `[data-mint-ref="${cleanRef}"]`;
+    const loc = page.locator(selector).first();
+    const count = await loc.count().catch(() => 0);
+    if (count === 0)
+        return undefined;
+    return await loc.evaluate((el, args) => {
+        const cleanText = (s) => s.replace(/\s+/g, " ").trim();
+        const accessibleName = (el.getAttribute("aria-label") || el.getAttribute("aria-labelledby") || el.textContent || "").toString();
+        // Build a compact ancestor-path string ("nav>UL>LI:Pricing") — 3 hops max.
+        // Helps the replay resolver scope to "the LI under nav with text Pricing"
+        // rather than just any element with that text.
+        const ancestors = [];
+        let cur = el.parentElement;
+        let hops = 0;
+        while (cur && hops < 3) {
+            const tag = cur.tagName.toUpperCase();
+            const role = cur.getAttribute("role");
+            const semHints = ["NAV", "MAIN", "ASIDE", "HEADER", "FOOTER", "FORM", "DIALOG", "SECTION", "ARTICLE", "UL", "OL", "LI", "TABLE", "TR"];
+            if (semHints.includes(tag) || role) {
+                ancestors.unshift(role ?? tag);
+            }
+            cur = cur.parentElement;
+            hops++;
+        }
+        const text = cleanText(el.textContent || "").slice(0, 120);
+        return {
+            ref: args.ref,
+            label: args.labelFallback || cleanText(accessibleName).slice(0, 80) || undefined,
+            testid: el.getAttribute("data-testid") || undefined,
+            stableId: el.getAttribute("data-mint-stable") || undefined,
+            role: el.getAttribute("role") || undefined,
+            accessibleName: cleanText(accessibleName).slice(0, 120) || undefined,
+            tag: el.tagName.toLowerCase(),
+            text,
+            ancestorPath: ancestors.length ? ancestors.join(">") : undefined
+        };
+    }, { ref: cleanRef, labelFallback }).catch(() => undefined);
+}
+/** Replay-time tiered resolver. Tries cheap-but-strict matches first, then
+ *  cascades to fuzzier ones, returning the first locator that resolves to a
+ *  visible+enabled element. Scoping is critical: we scope to <main> /
+ *  [role=main] FIRST so a "Pricing" label in the main content area beats a
+ *  "Pricing" entry in the nav. Falls back to global scope only if main-scope
+ *  finds nothing — that's the S1 risk #3 mitigation.
+ *
+ *  Returns the chosen Playwright locator + the tier that matched, or null
+ *  when none of the strategies found anything. Callers handle null by
+ *  declaring drift. */
+async function resolveTarget(page, target) {
+    // Scope #1: main content. Scope #2: full page. We try every tier inside
+    // each scope before widening to the next scope — this keeps the
+    // "label-collision between nav and main" case deterministic without
+    // sacrificing the global-fallback for pages with no <main>.
+    const mainScope = page.locator('main, [role="main"]');
+    const mainScopeCount = await mainScope.count().catch(() => 0);
+    const scopes = [];
+    if (mainScopeCount > 0)
+        scopes.push({ where: "main", root: mainScope.first() });
+    scopes.push({ where: "global", root: page });
+    const tryLocator = async (loc, tier) => {
+        const count = await loc.count().catch(() => 0);
+        for (let i = 0; i < Math.min(count, 5); i++) {
+            const candidate = loc.nth(i);
+            const visible = await candidate.isVisible({ timeout: 300 }).catch(() => false);
+            if (!visible)
+                continue;
+            const enabled = await candidate.isEnabled({ timeout: 300 }).catch(() => true);
+            if (!enabled)
+                continue;
+            return { locator: candidate, tier };
+        }
+        return null;
+    };
+    for (const scope of scopes) {
+        const root = scope.root;
+        // 1: data-testid — set by the app's own engineers, most stable.
+        if (target.testid) {
+            const hit = await tryLocator(root.locator(`[data-testid="${target.testid.replace(/"/g, '\\"')}"]`), "testid");
+            if (hit)
+                return hit;
+        }
+        // 2: data-mint-stable — our structural fingerprint, survives renames
+        //    + ref-renumbering as long as structure is unchanged.
+        if (target.stableId) {
+            const hit = await tryLocator(root.locator(`[data-mint-stable="${target.stableId.replace(/"/g, '\\"')}"]`), "stableId");
+            if (hit)
+                return hit;
+        }
+        // 3: role + accessible name (exact). Playwright's getByRole respects
+        //    the accessibility tree, so this matches semantic intent even when
+        //    the markup changes.
+        if (target.role && target.accessibleName) {
+            // getByRole accepts a string for `name`. Lower casing both sides
+            // would lose case-sensitivity guarantees for the exact form, so we
+            // pass the original accessibleName.
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const loc = root.getByRole(target.role, { name: target.accessibleName, exact: true });
+                const hit = await tryLocator(loc, "role_exact");
+                if (hit)
+                    return hit;
+            }
+            catch {
+                /* role not supported by getByRole — skip */
+            }
+        }
+        // 4: role + accessible name (loose).
+        if (target.role && target.accessibleName) {
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const loc = root.getByRole(target.role, { name: target.accessibleName, exact: false });
+                const hit = await tryLocator(loc, "role_loose");
+                if (hit)
+                    return hit;
+            }
+            catch {
+                /* role not supported — skip */
+            }
+        }
+        // 5: getByLabel — works well for form fields.
+        if (target.accessibleName) {
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const loc = root.getByLabel(target.accessibleName);
+                const hit = await tryLocator(loc, "label");
+                if (hit)
+                    return hit;
+            }
+            catch {
+                /* skip */
+            }
+        }
+        // 6: tag + text. Cheaper than getByText alone and disambiguates "Submit"
+        //    button from a heading that contains the word.
+        if (target.text && target.tag) {
+            const safe = target.text.replace(/"/g, '\\"').slice(0, 80);
+            const hit = await tryLocator(root.locator(`${target.tag}:has-text("${safe}")`), "text");
+            if (hit)
+                return hit;
+        }
+    }
+    // 7: per-snapshot ref fallback. This only works if the page has been
+    //    re-peeked recently and our ref still maps; usually it doesn't,
+    //    but we try anyway so a still-fresh trace can resolve cleanly.
+    if (target.ref) {
+        const hit = await tryLocator(page.locator(`[data-mint-ref="${target.ref.replace(/^@/, "")}"]`), "ref");
+        if (hit)
+            return hit;
+    }
+    return null;
+}
 /** Direct click by ref. Refs are set on the DOM via data-mint-ref by the most
  *  recent peek; they're unambiguous and bypass the label-matching heuristics. */
 async function clickByRef(page, ref, options = {}) {
@@ -43514,42 +44600,179 @@ async function fillByLabel(page, field, value) {
     }
     return { ok: false, detail: `No input found matching "${field}". Peek to see available inputs.` };
 }
+/** Patterns that collapse volatile DOM text into stable tokens.
+ *  ORDER MATTERS: longer / more specific patterns first so they don't get
+ *  cannibalized by shorter ones (e.g. ISO timestamps include dates; we want
+ *  them to match the ISO rule, not separately match the date rule). */
+const NORMALIZERS = (/* unused pure expression or super */ null && ([
+    // ISO 8601 timestamps with optional fractional seconds.
+    [/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?\b/g, "<ISO>"],
+    // Plain calendar dates (YYYY-MM-DD).
+    [/\b\d{4}-\d{2}-\d{2}\b/g, "<DATE>"],
+    // US-style slash dates (M/D/YY or MM/DD/YYYY).
+    [/\b\d{1,2}\/\d{1,2}\/\d{2,4}\b/g, "<DATE>"],
+    // Clock times with optional AM/PM. The trailing space + AM/PM is optional
+    // so plain "14:32" matches too.
+    [/\b\d{1,2}:\d{2}(?::\d{2})?\s?(?:AM|PM|am|pm)?\b/g, "<TIME>"],
+    // UUIDs.
+    [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<UUID>"],
+    // Bare hex blobs 24-40 chars (commit SHAs, session tokens). Comes before
+    // the generic <ID> rule because hex is a strict subset of base62.
+    [/\b[0-9a-f]{24,40}\b/gi, "<HEX>"],
+    // Opaque base62-ish identifiers 20-32 chars long. The lookahead excludes
+    // anything followed by `@` so we don't collapse email local-parts. Matches
+    // database row IDs, S3 keys, slug-shaped record handles.
+    [/\b[A-Za-z0-9_-]{20,32}\b(?=[^@])/g, "<ID>"],
+    // Relative-time strings: "5 minutes ago", "2 days ago".
+    [/\b\d+\s+(?:second|minute|hour|day|week|month|year)s?\s+ago\b/gi, "<AGO>"],
+    // Other relative-time words.
+    [/\b(?:just now|moments? ago|yesterday|today|tomorrow)\b/gi, "<REL>"],
+    // Monetary amounts.
+    [/\$\s?[\d,]+(?:\.\d{2})?/g, "<MONEY>"],
+    // Comma-separated big numbers (e.g. "1,234,567" or "12,345.67").
+    [/\b\d{1,3}(?:,\d{3})+(?:\.\d+)?\b/g, "<NUM>"],
+    // Any other 4+ digit run (timestamps in epoch ms, row counts).
+    [/\b\d{4,}\b/g, "<NUM>"]
+]));
+/** djb2 hash — small + good enough to detect change. Inlined into
+ *  page.evaluate so it can run in the page context without imports. */
+function pageStateHashClient() {
+    const NORM_SRC = [
+        ["\\b\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?Z?\\b", "g", "<ISO>"],
+        ["\\b\\d{4}-\\d{2}-\\d{2}\\b", "g", "<DATE>"],
+        ["\\b\\d{1,2}/\\d{1,2}/\\d{2,4}\\b", "g", "<DATE>"],
+        ["\\b\\d{1,2}:\\d{2}(?::\\d{2})?\\s?(?:AM|PM|am|pm)?\\b", "g", "<TIME>"],
+        ["\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b", "gi", "<UUID>"],
+        ["\\b[0-9a-f]{24,40}\\b", "gi", "<HEX>"],
+        ["\\b[A-Za-z0-9_-]{20,32}\\b(?=[^@])", "g", "<ID>"],
+        ["\\b\\d+\\s+(?:second|minute|hour|day|week|month|year)s?\\s+ago\\b", "gi", "<AGO>"],
+        ["\\b(?:just now|moments? ago|yesterday|today|tomorrow)\\b", "gi", "<REL>"],
+        ["\\$\\s?[\\d,]+(?:\\.\\d{2})?", "g", "<MONEY>"],
+        ["\\b\\d{1,3}(?:,\\d{3})+(?:\\.\\d+)?\\b", "g", "<NUM>"],
+        ["\\b\\d{4,}\\b", "g", "<NUM>"]
+    ];
+    const url = location.href;
+    const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
+    const buttons = document.querySelectorAll("button, [role='button']").length;
+    const inputs = document.querySelectorAll("input, textarea, select").length;
+    const links = document.querySelectorAll("a[href]").length;
+    const rawSeed = `${buttons}|${inputs}|${links}|${text.slice(0, 12000)}`;
+    let normSeed = rawSeed;
+    for (const [pattern, flags, replacement] of NORM_SRC) {
+        normSeed = normSeed.replace(new RegExp(pattern, flags), replacement);
+    }
+    const djb2 = (s) => {
+        let h = 5381;
+        for (let i = 0; i < s.length; i++)
+            h = ((h << 5) + h) ^ s.charCodeAt(i);
+        return (h >>> 0).toString(16);
+    };
+    return { url, bodyHash: djb2(normSeed), bodyHashRaw: djb2(rawSeed) };
+}
 async function pageStateHash(page) {
     try {
-        return await page.evaluate(() => {
-            const url = location.href;
-            // Hash from visible text + interactive element counts. Not crypto-secure;
-            // just needs to be stable + fast.
-            const text = (document.body?.innerText ?? "").replace(/\s+/g, " ").trim();
-            const buttons = document.querySelectorAll("button, [role='button']").length;
-            const inputs = document.querySelectorAll("input, textarea, select").length;
-            const links = document.querySelectorAll("a[href]").length;
-            // djb2 hash — small + good enough to detect change.
-            let h = 5381;
-            const seed = `${buttons}|${inputs}|${links}|${text.slice(0, 12000)}`;
-            for (let i = 0; i < seed.length; i++)
-                h = ((h << 5) + h) ^ seed.charCodeAt(i);
-            return { url, bodyHash: (h >>> 0).toString(16) };
-        });
+        return await page.evaluate(pageStateHashClient);
     }
     catch {
-        return { url: "", bodyHash: "" };
+        return { url: "", bodyHash: "", bodyHashRaw: "" };
     }
 }
+/** Apply the same normalization to a string in Node-land. Used by replay
+ *  drift detection where the hash is compared to a recorded one. */
+function normalizeForHash(input) {
+    let out = input;
+    for (const [pattern, replacement] of NORMALIZERS) {
+        out = out.replace(pattern, replacement);
+    }
+    return out;
+}
 function stateUnchanged(before, after) {
-    if (!before.bodyHash || !after.bodyHash)
-        return false;
-    return before.url === after.url && before.bodyHash === after.bodyHash;
+    if (!before.bodyHash || !after.bodyHash) {
+        return { unchanged: false, unchanged_strict: false };
+    }
+    const sameUrl = before.url === after.url;
+    return {
+        unchanged: sameUrl && before.bodyHash === after.bodyHash,
+        unchanged_strict: sameUrl && before.bodyHashRaw === after.bodyHashRaw
+    };
 }
 async function captureScreenshot(page, runDir, index) {
     const dir = external_node_path_namespaceObject.join(runDir, "step-screenshots");
     await (0,external_node_fs_promises_namespaceObject.mkdir)(dir, { recursive: true });
     await page.screenshot({ path: external_node_path_namespaceObject.join(dir, `step-${String(index).padStart(2, "0")}.png`), fullPage: false }).catch(() => undefined);
 }
+/** Negation pattern shared by runAgent and runAgentReplay so they treat
+ *  "the modal is no longer visible" / "X is gone" criteria identically. */
+const REPLAY_NEGATION_RE = /(no longer (visible|present|shown)|is gone|is hidden|isn'?t visible|is not visible|disappear(ed|s)|was removed|is removed|is closed|is dismissed|has closed)/i;
+/** Replay-only success criterion check. Mirrors runAgent's assert_visible
+ *  and count_check semantics so the same criterion produces the same
+ *  verdict whether the run came from the LLM agent or from replay.
+ *
+ *  Returns true when the criterion is satisfied. The criterion text itself
+ *  is the source of truth — we infer cardinality + negation from the words.
+ *
+ *  Behaviors:
+ *  - Negative ("X is no longer visible"): the named subject must NOT be
+ *    visible. We treat "couldn't find the subject" as proof of absence.
+ *    Strips the negation phrase from the criterion to derive the subject.
+ *  - Cardinal ("at least N X", "3 rows of Y"): counts row-like containers
+ *    holding the noun text; passes when count >= N.
+ *  - Positive: classic getByText.isVisible — matches today's behavior. */
+async function checkCriterionForReplay(page, crit) {
+    // Negative criterion: derive the subject by stripping the negation
+    // clause, then assert the subject is NOT visible. A timeout (no match)
+    // is the success signal — same convention as runAgent's assert_visible
+    // for negative criteria.
+    if (REPLAY_NEGATION_RE.test(crit)) {
+        const subject = crit
+            .replace(REPLAY_NEGATION_RE, "")
+            .replace(/^(the|a|an)\s+/i, "")
+            .trim()
+            .slice(0, 80);
+        if (subject.length < 3)
+            return false;
+        const visible = await page.getByText(subject, { exact: false }).first().isVisible({ timeout: 2_000 }).catch(() => false);
+        return !visible;
+    }
+    // Cardinal criterion: extract the number + noun. We match patterns like
+    // "at least 3 rows", "3 X visible", "≥3 entries" — same as runAgent's
+    // count_check matcher. Uses row-scoped count to avoid chrome FPs.
+    const numMatch = crit.match(/(?:at\s+least\s+|exactly\s+|≥\s*|>=\s*)?(\d+)\s+([a-z][a-z0-9\s_-]{2,40}?)\b/i);
+    if (numMatch) {
+        const required = Number(numMatch[1]);
+        const noun = numMatch[2].split(/\s+/).slice(0, 2).join(" ").trim();
+        if (required >= 1 && noun.length >= 3) {
+            const rowSelector = 'tr, [role="row"], li, [role="listitem"]';
+            const rowCount = await page.locator(rowSelector).filter({ hasText: noun }).count().catch(() => 0);
+            const pageCount = await page.getByText(noun, { exact: false }).count().catch(() => 0);
+            const used = rowCount > 0 ? rowCount : pageCount;
+            if (used >= required)
+                return true;
+            // Fall through to positive text-visibility check below — gives the
+            // criterion a second chance to match via its literal text (e.g.
+            // "3 articles scheduled" appears verbatim on the success screen).
+        }
+    }
+    // Positive: same as runAgent's assert_visible.first().isVisible().
+    return await page.getByText(crit, { exact: false }).first().isVisible({ timeout: 8_000 }).catch(() => false);
+}
 /** Deterministic replay of a previously-recorded agent trace. No LLM calls.
  *  Re-executes each tool in order, then verifies every success criterion. If
  *  any tool fails OR a criterion isn't satisfied, returns blocked so the
- *  caller can decide whether to fall back to fresh exploration. */
+ *  caller can decide whether to fall back to fresh exploration.
+ *
+ *  Note on `briefVersion`: replays filter out recorded peek entries
+ *  (they're observation noise, not actions) so no peek text is rendered
+ *  during a replay. The field is accepted here for contract completeness
+ *  and so a future replay verification step that DOES want to peek can
+ *  pick the matching format. Drift-fallback to runAgent reads the
+ *  version directly off the original brief in index.ts.
+ *
+ *  Drift detection (S1 risk #3): if the post-replay raw page hash is byte-
+ *  identical to the entry-URL hash, we declare drift even if criteria
+ *  literally match — the recording's actions never moved the page off the
+ *  entry, so any "matched" criterion is matching pre-existing chrome text
+ *  rather than fresh post-flow state. */
 async function runAgentReplay(input) {
     const { page, baseUrl, runDir, trace, steps } = input;
     const liveTrace = [];
@@ -43561,12 +44784,18 @@ async function runAgentReplay(input) {
     catch {
         /* non-fatal */
     }
+    // Capture the entry-URL hash so we can detect "the replay ran but never
+    // moved the page" as drift, not pass. The raw hash is the right signal
+    // here: even normalized differences (a date that ticked, an ID rotated)
+    // indicate the page DID re-render in response to our actions.
+    const entryHash = await pageStateHash(page);
     // Skip recorded `peek` calls — they're observation noise. Skip `complete`
     // too; we'll declare the verdict after re-verifying criteria.
     const executable = trace.filter((t) => t.tool !== "peek" && t.tool !== "complete");
     for (const entry of executable) {
         toolCalls++;
         const inp = entry.input ?? {};
+        const richTarget = entry.target;
         let resultText = "";
         let ok = true;
         try {
@@ -43577,21 +44806,45 @@ async function runAgentReplay(input) {
                 steps.push(resultText);
             }
             else if (entry.tool === "click") {
-                // Replay path: trust the recorded trace. Prefer label (stable across
-                // runs) over ref (numbering depends on current DOM). Ref-only
-                // recordings will likely drift → handled by the fallback flow.
+                // Replay click: prefer the rich target (testid/stableId/role+name/
+                // text cascade), then fall back to label, then ref. The cascade is
+                // what makes replay survive small UI tweaks the recording wouldn't
+                // know about — a class change, a wrapper added, etc.
                 const label = String(inp.label ?? "");
                 const ref = String(inp.ref ?? "").trim();
-                const out = label
-                    ? await clickByLabel(page, label, inp.kind ?? "any", {
-                        confirmDestructive: true,
-                        givingUpOnCriterion: "replay"
-                    })
-                    : ref
-                        ? await clickByRef(page, ref, { confirmDestructive: true, givingUpOnCriterion: "replay" })
-                        : { ok: false, detail: "Replay click missing both ref and label." };
-                ok = out.ok;
-                resultText = out.detail;
+                if (richTarget) {
+                    const resolved = await resolveTarget(page, richTarget);
+                    if (resolved) {
+                        try {
+                            await resolved.locator.click({ timeout: 4000 });
+                            ok = true;
+                            resultText = `Clicked "${richTarget.label ?? richTarget.text}" via ${resolved.tier}.`;
+                        }
+                        catch (err) {
+                            ok = false;
+                            resultText = `Resolved target via ${resolved.tier} but click failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`;
+                        }
+                    }
+                    else {
+                        ok = false;
+                        resultText = `Resolver found no match for "${richTarget.label ?? richTarget.text}" (testid=${richTarget.testid ?? "-"}, stable=${richTarget.stableId ?? "-"}). UI drifted.`;
+                    }
+                }
+                else {
+                    // No rich target — fall back to the legacy paths. Mark replay
+                    // intent so destructive-label gates allow these (the original
+                    // recording already passed the gate).
+                    const out = label
+                        ? await clickByLabel(page, label, inp.kind ?? "any", {
+                            confirmDestructive: true,
+                            givingUpOnCriterion: "replay"
+                        })
+                        : ref
+                            ? await clickByRef(page, ref, { confirmDestructive: true, givingUpOnCriterion: "replay" })
+                            : { ok: false, detail: "Replay click missing both ref and label." };
+                    ok = out.ok;
+                    resultText = out.detail;
+                }
                 if (ok)
                     steps.push(resultText);
             }
@@ -43599,13 +44852,33 @@ async function runAgentReplay(input) {
                 const field = String(inp.field ?? "");
                 const ref = String(inp.ref ?? "").trim();
                 const value = String(inp.value ?? "");
-                const out = field
-                    ? await fillByLabel(page, field, value)
-                    : ref
-                        ? await fillByRef(page, ref, value)
-                        : { ok: false, detail: "Replay fill missing both ref and field." };
-                ok = out.ok;
-                resultText = out.detail;
+                if (richTarget) {
+                    const resolved = await resolveTarget(page, richTarget);
+                    if (resolved) {
+                        try {
+                            await resolved.locator.fill(value, { timeout: 3000 });
+                            ok = true;
+                            resultText = `Filled "${richTarget.label ?? richTarget.text}" via ${resolved.tier}.`;
+                        }
+                        catch (err) {
+                            ok = false;
+                            resultText = `Resolved fill target via ${resolved.tier} but fill failed: ${err instanceof Error ? err.message.slice(0, 200) : ""}`;
+                        }
+                    }
+                    else {
+                        ok = false;
+                        resultText = `Resolver found no match for input "${richTarget.label ?? richTarget.text}" — UI drifted.`;
+                    }
+                }
+                else {
+                    const out = field
+                        ? await fillByLabel(page, field, value)
+                        : ref
+                            ? await fillByRef(page, ref, value)
+                            : { ok: false, detail: "Replay fill missing both ref and field." };
+                    ok = out.ok;
+                    resultText = out.detail;
+                }
                 if (ok)
                     steps.push(resultText);
             }
@@ -43687,18 +44960,35 @@ async function runAgentReplay(input) {
             };
         }
     }
-    // Verify all success criteria after replay completes.
+    // Drift gate: if the raw page hash hasn't moved at all from the entry,
+    // none of the replayed actions changed visible state. Any criterion match
+    // is therefore matching pre-existing entry-URL chrome — declare drift,
+    // not pass. We compare raw (not normalized) because even a date ticking
+    // is evidence the page re-rendered for some reason.
+    const postHash = await pageStateHash(page);
+    const noMovement = postHash.bodyHashRaw && entryHash.bodyHashRaw && postHash.bodyHashRaw === entryHash.bodyHashRaw && postHash.url === entryHash.url;
+    if (noMovement) {
+        return {
+            status: "blocked",
+            summary: `Replay finished but post-replay page hash is byte-identical to the entry-URL hash. None of the recorded actions changed the page — most likely the UI structure has drifted and the recorded clicks resolved against the wrong elements (or no-ops). Re-record this flow.`,
+            toolCalls,
+            turns: 1,
+            trace: liveTrace
+        };
+    }
+    // Verify all success criteria after replay completes — same semantics
+    // as runAgent's per-criterion checks (positive, negative, cardinal).
     const failed = [];
     for (const crit of input.successCriteria) {
-        const visible = await page.getByText(crit, { exact: false }).first().isVisible({ timeout: 8_000 }).catch(() => false);
-        if (!visible)
+        const passed = await checkCriterionForReplay(page, crit);
+        if (!passed)
             failed.push(crit);
     }
     await captureScreenshot(page, runDir, steps.length + 1);
     if (failed.length > 0) {
         return {
             status: "blocked",
-            summary: `Replay finished but ${failed.length} success criterion/criteria not visible: ${failed.join(" | ")}.`,
+            summary: `Replay finished but ${failed.length} success criterion/criteria not verified: ${failed.join(" | ")}.`,
             toolCalls,
             turns: 1,
             trace: liveTrace
@@ -43712,6 +45002,41 @@ async function runAgentReplay(input) {
         trace: liveTrace
     };
 }
+/** Per-run wait budget cap (aggregate across wait_for_progress +
+ *  wait_for_dom_stable). Three minutes is the limit beyond which the agent
+ *  is almost certainly stuck and should abort to a blocked verdict instead
+ *  of burning turns waiting for a page that isn't coming. */
+const MAX_WAIT_BUDGET_MS = 180_000;
+/** Heuristic: find the success criterion whose text most overlaps with the
+ *  wait's `reason` string. Returns the 0-based index, or -1 when nothing
+ *  scores above the threshold. Used to scope attestation locks to the
+ *  criterion the agent was actually trying to verify. Token overlap with a
+ *  3-word stopword filter — cheap, deterministic, no LLM. */
+function lockMatchingCriterion(criteria, reason, attestationLocks) {
+    const r = reason.toLowerCase();
+    if (!r)
+        return -1;
+    const STOP = new Set(["the", "a", "an", "is", "of", "to", "for", "and", "or", "be", "in", "on", "at", "by", "from", "with", "after", "before", "this", "that", "verify", "verifying", "wait", "waiting"]);
+    const rTokens = new Set(r.split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !STOP.has(w)));
+    if (rTokens.size === 0)
+        return -1;
+    let best = -1;
+    let bestScore = 0;
+    criteria.forEach((c, i) => {
+        const cTokens = c.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 4 && !STOP.has(w));
+        const overlap = cTokens.filter((w) => rTokens.has(w)).length;
+        if (overlap > bestScore) {
+            best = i;
+            bestScore = overlap;
+        }
+    });
+    // Require at least 2 overlapping significant tokens. With <2 it's noise.
+    if (bestScore >= 2 && best >= 0) {
+        attestationLocks.setLock(best);
+        return best;
+    }
+    return -1;
+}
 async function runAgent(input) {
     const { page, baseUrl, runDir, agent, steps } = input;
     // 15 was too tight for multi-step flows: a signup + onboarding test
@@ -43723,12 +45048,73 @@ async function runAgent(input) {
     const maxTurns = input.maxTurns ?? 30;
     const trace = [];
     const quantitativeObservations = [];
-    // Land on the entry page before the agent's first turn — saves one tool call.
+    // Pre-dismiss the blawg first-time-user TourOverlay for non-tour
+    // tests on tour-prone routes (dashboard / blog / settings / etc.).
+    // The overlay portals into body root and silently covers assertable
+    // controls — without this guard, dashboard tests fail because the
+    // agent peeks and sees overlay copy instead of the actual UI. Must
+    // run BEFORE probeEntryUrl because addInitScript only takes effect on
+    // subsequent navigations.
+    await maybeInjectDismissedTourState(page, {
+        goal: input.goal,
+        entryUrl: input.entryUrl
+    });
+    // Backend health pre-check: customers occasionally push a PR where the
+    // dev server crashes on boot (env var typo, broken migration, etc.).
+    // Without this guard the agent burns its whole turn budget calling
+    // peek/click against a 500-page or a hard navigation error. Attach
+    // the monitor BEFORE the entry goto so the initial XHRs fire through
+    // it; we'll inspect the count before handing control to the agent.
+    const healthMonitor = attachBackendHealthMonitor(page);
+    // Probe entry with a hard 10s timeout instead of the agent's normal
+    // 30s — if the customer's backend is fully down, waiting 30s just
+    // to say "blocked" burns runner minutes.
+    const entryFailure = await probeEntryUrl(page, agent_loop_absoluteUrl(baseUrl, input.entryUrl));
+    if (entryFailure) {
+        healthMonitor.detach();
+        return {
+            status: "blocked",
+            summary: entryFailure.kind === "server_5xx"
+                ? `Backend service appears down: entry URL ${input.entryUrl} returned ${entryFailure.status}.`
+                : `Backend service appears down: entry URL ${input.entryUrl} did not respond within 10s (${entryFailure.errorText ?? "unknown error"}).`,
+            toolCalls: 0,
+            turns: 0,
+            trace
+        };
+    }
+    // Resolve a stable runId — caller can pass one explicitly, otherwise
+    // derive from runDir basename so the attestation-lock keys stay unique
+    // per concurrent run.
+    const runId = input.runId || external_node_path_namespaceObject.basename(runDir) || `run-${Date.now()}`;
+    // Per-run wait budget — millis spent inside wait_for_progress /
+    // wait_for_dom_stable. Once we hit MAX_WAIT_BUDGET_MS we refuse further
+    // waits and tell the agent to peek + try a different action.
+    let waitBudgetUsedMs = 0;
+    // Bound the attestation-lock writer to this run. Phase G's complete()
+    // handler imports `isLocked` separately and reads the same registry.
+    const { lockCriterion } = await __nccwpck_require__.e(/* import() */ 862).then(__nccwpck_require__.bind(__nccwpck_require__, 1862));
+    const attestationLocks = {
+        runId,
+        setLock: (idx) => lockCriterion(runId, idx)
+    };
+    // Give in-flight initial XHRs a brief moment to fire/fail so the
+    // backend-down check below has signal. We only care about completing
+    // pending requests, not perfect networkidle — cap at 2s.
     try {
-        await page.goto(agent_loop_absoluteUrl(baseUrl, input.entryUrl), { waitUntil: "domcontentloaded", timeout: 30_000 });
+        await page.waitForLoadState("networkidle", { timeout: 2_000 });
     }
     catch {
-        /* non-fatal — agent can navigate via tool */
+        /* networkidle isn't required — proceed */
+    }
+    if (healthMonitor.count() >= BACKEND_DOWN_THRESHOLD) {
+        healthMonitor.detach();
+        return {
+            status: "blocked",
+            summary: `Backend service appears down (3+ localhost failures in first 30s). ${summarizeFailures(healthMonitor.recent())}`,
+            toolCalls: 0,
+            turns: 0,
+            trace
+        };
     }
     const messages = [{
             role: "user",
@@ -43741,8 +45127,13 @@ async function runAgent(input) {
     // with whatever the evidence ledger has accumulated so far. Thresholds
     // are intentionally conservative — most legitimate retries (e.g.
     // waiting for an animation) finish in 1-2 attempts.
+    //
+    // Tier-aware threshold (D4): slower/cheaper models genuinely need a few
+    // more turns of context-building before a forward move. Defaulting to
+    // "opus" when the caller doesn't specify avoids regressing existing
+    // production runs that don't pass model yet.
     const { RepetitionGuard } = await Promise.resolve(/* import() */).then(__nccwpck_require__.bind(__nccwpck_require__, 7302));
-    const guard = new RepetitionGuard();
+    const guard = new RepetitionGuard({ model: input.model ?? "opus" });
     let pendingGuardAdvice = null;
     let turns = 0;
     let toolCalls = 0;
@@ -43753,524 +45144,814 @@ async function runAgent(input) {
     // Static system prompt — build once. Per-turn progress goes in user msgs
     // so the system prefix stays byte-identical → prompt-cache hits.
     const system = staticSystemPrompt(input);
-    while (turns < maxTurns && !verdict) {
-        turns++;
-        let response;
-        try {
-            response = await agent({ system, messages, tools: AGENT_TOOLS, maxTokens: 2048 });
-        }
-        catch (err) {
-            return {
-                status: "blocked",
-                summary: `Agent turn ${turns} failed: ${err instanceof Error ? err.message : String(err)}`,
-                toolCalls,
-                turns,
-                trace
-            };
-        }
-        // Record the assistant message verbatim — required for the next turn.
-        messages.push({ role: "assistant", content: response.content });
-        const toolResults = [];
-        for (const block of response.content) {
-            const b = block;
-            if (b.type === "text" && b.text) {
-                // Agent reasoning. Not surfaced as a step on its own; the next tool call will be.
+    // Most recent snapshot from a `peek` (or `peek_visual`). Used by the
+    // delta-peek formatter to emit only what's changed since the last
+    // observation. Reset to `null` on the first peek of the run so the
+    // baseline format is used (delta needs SOMETHING to diff against).
+    let prevSnapshot = null;
+    // v1 (or unset) means legacy peeks: the recorded trace (or the caller
+    // that hasn't been plumbed through yet) assumes every peek returns the
+    // FULL layout. Default to legacy on unset so missing-field callers get
+    // the conservative behavior; the v2 opt-in is explicit (set on every
+    // fresh brief by generateAgentBriefFromIntent).
+    const useLegacyPeek = (input.briefVersion ?? "v1") === "v1";
+    // Per-peek telemetry runId. Fresh `runAgent` calls write under a
+    // timestamped directory; the basename is the closest thing to a stable
+    // identifier the loop has access to without rewiring the call sites.
+    const runIdForTelemetry = external_node_path_namespaceObject.basename(runDir);
+    try {
+        while (turns < maxTurns && !verdict) {
+            // Recheck backend health each turn until the watch window expires.
+            // Catches the case where the dev server crashed AFTER the entry
+            // page loaded but during the agent's first few interactions.
+            if (healthMonitor.isOpen() && healthMonitor.count() >= BACKEND_DOWN_THRESHOLD) {
+                return {
+                    status: "blocked",
+                    summary: `Backend service appears down (3+ localhost failures in first 30s). ${summarizeFailures(healthMonitor.recent())}`,
+                    toolCalls,
+                    turns,
+                    trace
+                };
             }
-            else if (b.type === "tool_use" && b.name && b.id) {
-                toolCalls++;
-                const name = b.name;
-                const inp = b.input ?? {};
-                let resultText = "";
-                let ok = true;
-                // Set by handlers that perform an action on the page (click, fill,
-                // scroll, navigate, press_key). Reads/asserts leave it undefined,
-                // which the repetition guard interprets as "doesn't count toward
-                // stagnation" (because reads have no DOM-change semantics).
-                let domChanged;
-                try {
-                    if (name === "navigate") {
-                        const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
-                        const before = await pageStateHash(page);
-                        await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
-                        resultText = `Navigated to ${target}.`;
-                        steps.push(`Navigated to ${target}.`);
-                        await captureScreenshot(page, runDir, steps.length);
-                        await input.onScreenshot?.(steps.length);
-                        const after = await pageStateHash(page);
-                        domChanged = !stateUnchanged(before, after);
-                        if (!domChanged) {
-                            resultText += `\n⚠️ Already on this URL — page didn't change. Don't navigate here again; pick a different next step (click into nav, fill a form, etc.).`;
+            turns++;
+            let response;
+            try {
+                // Strip base64 PNGs from older peek_visual results so we're not
+                // paying input-token price to re-send 70-100KB of stale visuals
+                // every turn. Only the most recent visual peek's image survives;
+                // older images are replaced by a tiny text marker that still
+                // breadcrumbs back to the captured step screenshot.
+                const messagesForTurn = stripStalePeekVisuals(messages);
+                response = await agent({ system, messages: messagesForTurn, tools: AGENT_TOOLS, maxTokens: 2048 });
+            }
+            catch (err) {
+                return {
+                    status: "blocked",
+                    summary: `Agent turn ${turns} failed: ${err instanceof Error ? err.message : String(err)}`,
+                    toolCalls,
+                    turns,
+                    trace
+                };
+            }
+            // Record the assistant message verbatim — required for the next turn.
+            messages.push({ role: "assistant", content: response.content });
+            const toolResults = [];
+            for (const block of response.content) {
+                const b = block;
+                if (b.type === "text" && b.text) {
+                    // Agent reasoning. Not surfaced as a step on its own; the next tool call will be.
+                }
+                else if (b.type === "tool_use" && b.name && b.id) {
+                    toolCalls++;
+                    const name = b.name;
+                    const inp = b.input ?? {};
+                    let resultText = "";
+                    let ok = true;
+                    // Set by handlers that perform an action on the page (click, fill,
+                    // scroll, navigate, press_key). Reads/asserts leave it undefined,
+                    // which the repetition guard interprets as "doesn't count toward
+                    // stagnation" (because reads have no DOM-change semantics).
+                    let domChanged;
+                    // Per-step page fingerprints. Captured by action handlers and
+                    // attached to the trace entry below. Reads leave them undefined.
+                    let preHash;
+                    let postHash;
+                    // Rich target captured by click/fill so replay can fall back from
+                    // ref → testid → stableId → role+name → text without depending on
+                    // per-snapshot ref numbers that drift between runs.
+                    let targetCapture;
+                    try {
+                        if (name === "navigate") {
+                            const target = agent_loop_absoluteUrl(baseUrl, String(inp.path ?? "/"));
+                            preHash = await pageStateHash(page);
+                            await page.goto(target, { waitUntil: "domcontentloaded", timeout: 30_000 });
+                            resultText = `Navigated to ${target}.`;
+                            steps.push(`Navigated to ${target}.`);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                            postHash = await pageStateHash(page);
+                            domChanged = !stateUnchanged(preHash, postHash).unchanged;
+                            if (!domChanged) {
+                                resultText += `\n⚠️ Already on this URL — page didn't change. Don't navigate here again; pick a different next step (click into nav, fill a form, etc.).`;
+                            }
                         }
-                    }
-                    else if (name === "peek" || name === "peek_visual") {
-                        const snap = await snapshotPage(page);
-                        const baseText = formatSnapshot(snap);
-                        const isVisual = name === "peek_visual";
-                        // Text-only peek is the default; peek_visual adds a screenshot only
-                        // when the agent explicitly opts in (much cheaper context-wise).
-                        const png = isVisual
-                            ? await page.screenshot({ fullPage: false, type: "png" }).catch(() => null)
-                            : null;
-                        const visualHint = png
-                            ? `\n\nVISUAL CHECK (read the screenshot — that's why you called peek_visual):
+                        else if (name === "peek" || name === "peek_visual") {
+                            const snap = await snapshotPage(page);
+                            // Delta-encode against the previous snapshot (when available
+                            // and the brief opts in). Legacy traces stay on the full
+                            // layout so replay output is byte-identical to what the
+                            // recording agent saw. The returned telemetry tells us how
+                            // many bytes the delta saved this turn.
+                            const formatted = formatPeek(snap, prevSnapshot, { legacy: useLegacyPeek });
+                            const baseText = formatted.text;
+                            // Mint telemetry: one line per peek. Picked up by run-log
+                            // scrapers + cost reports so we can verify the delta path is
+                            // actually winning bytes in real flows (R7 found 64% of bytes
+                            // were repeating across peeks pre-delta).
+                            // eslint-disable-next-line no-console
+                            console.log(`[mint:peek_delta] runId=${runIdForTelemetry} turn=${turns} ` +
+                                `saved_bytes=${formatted.savedBytes} baseline_bytes=${formatted.baselineBytes} ` +
+                                `compression_ratio=${formatted.compressionRatio.toFixed(3)} ` +
+                                `mode=${formatted.usedDelta ? "delta" : "full"}`);
+                            // Cache for next turn. Update BEFORE potentially returning so
+                            // the next peek diffs against THIS one even if a visual
+                            // peek_visual short-circuits below.
+                            prevSnapshot = snap;
+                            const isVisual = name === "peek_visual";
+                            // Text-only peek is the default; peek_visual adds a screenshot only
+                            // when the agent explicitly opts in (much cheaper context-wise).
+                            const png = isVisual
+                                ? await page.screenshot({ fullPage: false, type: "png" }).catch(() => null)
+                                : null;
+                            const visualHint = png
+                                ? `\n\nVISUAL CHECK (read the screenshot — that's why you called peek_visual):
 - Selected items have colored borders / check marks. Don't re-click them.
 - Spinners / "Generating…" mean wait, not act.
 - Compare to the previous screenshot — what changed?`
-                            : "";
-                        resultText = baseText + visualHint;
-                        trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 4000) });
-                        toolResults.push({
-                            type: "tool_result",
-                            tool_use_id: b.id,
-                            content: png
-                                ? [
-                                    { type: "text", text: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText },
-                                    { type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }
-                                ]
-                                : (resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText)
-                        });
-                        continue;
-                    }
-                    else if (name === "click") {
-                        const ref = String(inp.ref ?? "").trim();
-                        const label = String(inp.label ?? "");
-                        // Identity key for repeat-click detection. Prefer ref if given.
-                        const key = ref ? `ref:${ref.replace(/^@/, "")}` : `label:${label.toLowerCase()}`;
-                        const lastClick = [...trace].reverse().find((t) => t.tool === "click");
-                        const lastKey = lastClick
-                            ? (lastClick.input?.ref
-                                ? `ref:${String(lastClick.input.ref).replace(/^@/, "")}`
-                                : `label:${String(lastClick.input?.label ?? "").toLowerCase()}`)
-                            : "";
-                        if (lastKey && lastKey === key) {
-                            ok = false;
-                            resultText = `Refused: you just clicked the same target on the previous turn (${key}). Repeating never helps — peek to verify the page changed and pick a DIFFERENT action.`;
+                                : "";
+                            resultText = baseText + visualHint;
+                            trace.push({ tool: name, input: inp, ok: true, result: baseText.slice(0, 4000) });
+                            toolResults.push({
+                                type: "tool_result",
+                                tool_use_id: b.id,
+                                content: png
+                                    ? [
+                                        { type: "text", text: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText },
+                                        { type: "image", source: { type: "base64", media_type: "image/png", data: png.toString("base64") } }
+                                    ]
+                                    : (resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText)
+                            });
+                            continue;
                         }
-                        else if (!ref && !label) {
-                            ok = false;
-                            resultText = `Refused: click requires either ref or label. Pass ref="e1" (from your last peek) for deterministic targeting.`;
-                        }
-                        else {
-                            const before = await pageStateHash(page);
-                            const out = ref
-                                ? await clickByRef(page, ref, {
-                                    confirmDestructive: inp.confirm_destructive === true,
-                                    givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
-                                })
-                                : await clickByLabel(page, label, inp.kind ?? "any", {
-                                    confirmDestructive: inp.confirm_destructive === true,
-                                    givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
-                                });
-                            ok = out.ok;
-                            resultText = out.detail;
-                            if (out.ok) {
-                                steps.push(out.detail);
-                                // Smart wait: clicks on actionable controls (Test/Submit/
-                                // Connect/Save/etc.) often trigger async server roundtrips.
-                                // Instead of a fixed timeout that's either too short (response
-                                // not back yet) or too slow (every click pays the worst case),
-                                // poll for DOM changes up to 10s and exit as soon as something
-                                // changes. Non-actionable clicks just get the standard 400ms.
-                                const ACTIONABLE_LABEL = /\b(test|submit|connect|save|send|apply|verify|sync|publish|deploy|run|sign|log|reset|invite|generate)\b/i;
-                                const labelGuess = String(inp.label ?? "") || (ref ? `(ref ${ref})` : "");
-                                const isActionable = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail);
-                                if (isActionable) {
-                                    // Slow APIs (DNS lookups, OAuth roundtrips, connection
-                                    // tests) can take 20-30s before any visible change. Poll
-                                    // up to 30s; exit early on the first DOM change.
-                                    await page.waitForTimeout(500); // initial settle
-                                    const initial = await pageStateHash(page);
-                                    const deadline = Date.now() + 30_000;
-                                    while (Date.now() < deadline) {
-                                        await page.waitForTimeout(500);
-                                        const now = await pageStateHash(page);
-                                        if (!stateUnchanged(initial, now))
-                                            break;
-                                    }
-                                }
-                                else {
-                                    await page.waitForTimeout(400);
-                                }
-                                await captureScreenshot(page, runDir, steps.length);
-                                await input.onScreenshot?.(steps.length);
-                                const after = await pageStateHash(page);
-                                domChanged = !stateUnchanged(before, after);
-                                if (!domChanged) {
-                                    // For actionable clicks, an unchanged DOM after 30s most
-                                    // likely means the API is still in flight (or the
-                                    // response renders into something the hash misses) —
-                                    // tell the agent to peek again, NOT to retry the click.
-                                    if (isActionable) {
-                                        resultText += `\n⚠️ The click registered but the page hasn't changed after 30s. The backend call may still be processing — peek again (don't re-click, that's hard-refused). If still no response, the action may render its result asynchronously into a portal/toast.`;
-                                    }
-                                    else {
-                                        resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state. DO NOT click the same target again — peek and pick a different action.`;
-                                        ok = false;
-                                    }
-                                }
+                        else if (name === "click") {
+                            const ref = String(inp.ref ?? "").trim();
+                            const label = String(inp.label ?? "");
+                            // Identity key for repeat-click detection. Prefer ref if given.
+                            const key = ref ? `ref:${ref.replace(/^@/, "")}` : `label:${label.toLowerCase()}`;
+                            const lastClick = [...trace].reverse().find((t) => t.tool === "click");
+                            const lastKey = lastClick
+                                ? (lastClick.input?.ref
+                                    ? `ref:${String(lastClick.input.ref).replace(/^@/, "")}`
+                                    : `label:${String(lastClick.input?.label ?? "").toLowerCase()}`)
+                                : "";
+                            if (lastKey && lastKey === key) {
+                                ok = false;
+                                resultText = `Refused: you just clicked the same target on the previous turn (${key}). Repeating never helps — peek to verify the page changed and pick a DIFFERENT action.`;
                             }
-                        }
-                    }
-                    else if (name === "fill") {
-                        const ref = String(inp.ref ?? "").trim();
-                        const field = String(inp.field ?? "");
-                        const value = String(inp.value ?? "");
-                        if (!ref && !field) {
-                            ok = false;
-                            resultText = `Refused: fill requires either ref or field.`;
-                        }
-                        else {
-                            const before = await pageStateHash(page);
-                            const out = ref ? await fillByRef(page, ref, value) : await fillByLabel(page, field, value);
-                            ok = out.ok;
-                            resultText = out.detail;
-                            if (out.ok) {
-                                steps.push(out.detail);
-                                await captureScreenshot(page, runDir, steps.length);
-                                await input.onScreenshot?.(steps.length);
-                                const after = await pageStateHash(page);
-                                if (stateUnchanged(before, after)) {
-                                    resultText += `\n⚠️ No observable effect: page unchanged after fill. Input may already hold this value.`;
-                                }
-                            }
-                        }
-                    }
-                    else if (name === "press_key") {
-                        const key = String(inp.key ?? "Escape");
-                        const before = await pageStateHash(page);
-                        await page.keyboard.press(key);
-                        await page.waitForTimeout(300);
-                        resultText = `Pressed ${key}.`;
-                        steps.push(`Pressed ${key}.`);
-                        await captureScreenshot(page, runDir, steps.length);
-                        await input.onScreenshot?.(steps.length);
-                        const after = await pageStateHash(page);
-                        domChanged = !stateUnchanged(before, after);
-                        if (!domChanged) {
-                            resultText += `\n⚠️ No observable effect: page unchanged after pressing ${key}. Don't repeat this key — pick a different action.`;
-                        }
-                    }
-                    else if (name === "scroll") {
-                        const amount = String(inp.amount ?? "page_down");
-                        const beforeY = await page.evaluate(() => window.scrollY);
-                        if (amount === "page_down") {
-                            await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
-                        }
-                        else if (amount === "page_up") {
-                            await page.evaluate(() => window.scrollBy({ top: -Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
-                        }
-                        else if (amount === "top") {
-                            await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
-                        }
-                        else if (amount === "bottom") {
-                            await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, left: 0, behavior: "instant" }));
-                        }
-                        else {
-                            const px = Number.parseInt(amount, 10);
-                            if (Number.isFinite(px)) {
-                                await page.evaluate((p) => window.scrollBy({ top: p, left: 0, behavior: "instant" }), px);
+                            else if (!ref && !label) {
+                                ok = false;
+                                resultText = `Refused: click requires either ref or label. Pass ref="e1" (from your last peek) for deterministic targeting.`;
                             }
                             else {
-                                resultText = `Invalid scroll amount "${amount}". Use page_down | page_up | top | bottom | <pixel count>.`;
-                                steps.push(`Invalid scroll amount.`);
-                                trace.push({ tool: "scroll", input: inp, ok: false, result: resultText });
-                                toolResults.push({ type: "tool_result", tool_use_id: b.id, content: resultText });
-                                continue;
+                                preHash = await pageStateHash(page);
+                                // Capture rich target BEFORE the click — after click the DOM
+                                // may unmount the targeted element and we'd get nothing.
+                                if (ref) {
+                                    targetCapture = await captureRichTarget(page, ref, label).catch(() => undefined);
+                                }
+                                const out = ref
+                                    ? await clickByRef(page, ref, {
+                                        confirmDestructive: inp.confirm_destructive === true,
+                                        givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
+                                    })
+                                    : await clickByLabel(page, label, inp.kind ?? "any", {
+                                        confirmDestructive: inp.confirm_destructive === true,
+                                        givingUpOnCriterion: String(inp.giving_up_on_criterion ?? "")
+                                    });
+                                ok = out.ok;
+                                resultText = out.detail;
+                                if (out.ok) {
+                                    steps.push(out.detail);
+                                    // Smart wait: clicks on actionable controls (Test/Submit/
+                                    // Connect/Save/etc.) often trigger async server roundtrips.
+                                    // Instead of a fixed timeout that's either too short (response
+                                    // not back yet) or too slow (every click pays the worst case),
+                                    // poll for DOM changes up to 10s and exit as soon as something
+                                    // changes. Non-actionable clicks just get the standard 400ms.
+                                    const ACTIONABLE_LABEL = /\b(test|submit|connect|save|send|apply|verify|sync|publish|deploy|run|sign|log|reset|invite|generate)\b/i;
+                                    const labelGuess = String(inp.label ?? "") || (ref ? `(ref ${ref})` : "");
+                                    const isActionable = ACTIONABLE_LABEL.test(labelGuess) || ACTIONABLE_LABEL.test(out.detail);
+                                    if (isActionable) {
+                                        // Slow APIs (DNS lookups, OAuth roundtrips, connection
+                                        // tests) can take 20-30s before any visible change. Poll
+                                        // up to 30s; exit early on the first DOM change.
+                                        await page.waitForTimeout(500); // initial settle
+                                        const initial = await pageStateHash(page);
+                                        const deadline = Date.now() + 30_000;
+                                        while (Date.now() < deadline) {
+                                            await page.waitForTimeout(500);
+                                            const now = await pageStateHash(page);
+                                            if (!stateUnchanged(initial, now).unchanged)
+                                                break;
+                                        }
+                                    }
+                                    else {
+                                        await page.waitForTimeout(400);
+                                    }
+                                    await captureScreenshot(page, runDir, steps.length);
+                                    await input.onScreenshot?.(steps.length);
+                                    postHash = await pageStateHash(page);
+                                    domChanged = !stateUnchanged(preHash, postHash).unchanged;
+                                    if (!domChanged) {
+                                        // For actionable clicks, an unchanged DOM after 30s most
+                                        // likely means the API is still in flight (or the
+                                        // response renders into something the hash misses) —
+                                        // tell the agent to peek again, NOT to retry the click.
+                                        if (isActionable) {
+                                            resultText += `\n⚠️ The click registered but the page hasn't changed after 30s. The backend call may still be processing — peek again (don't re-click, that's hard-refused). If still no response, the action may render its result asynchronously into a portal/toast.`;
+                                        }
+                                        else {
+                                            resultText += `\n⚠️ No observable effect: URL + visible DOM unchanged after the click. Likely already in this state. DO NOT click the same target again — peek and pick a different action.`;
+                                            ok = false;
+                                        }
+                                    }
+                                    // Slow-endpoint hint (D5). If the clicked label matches a
+                                    // declared slow endpoint, tell the agent the expected wait
+                                    // budget — much more reliable than the agent guessing how
+                                    // long the backend takes. The hint goes into the tool_result
+                                    // text regardless of whether the DOM has changed yet, because
+                                    // even an early DOM change might just be a loading spinner.
+                                    const labelForMatch = String(inp.label ?? "") || (targetCapture?.label ?? "") || (targetCapture?.text ?? "");
+                                    if (labelForMatch && (input.slowEndpoints?.length ?? 0) > 0) {
+                                        for (const ep of input.slowEndpoints ?? []) {
+                                            if (!ep.triggered_by_label_regex)
+                                                continue;
+                                            try {
+                                                const re = new RegExp(ep.triggered_by_label_regex, "i");
+                                                if (re.test(labelForMatch)) {
+                                                    resultText += `\nHint: this control triggers ~${ep.expected_seconds}s of backend work. Call wait_for_progress({ timeoutSec: ${ep.expected_seconds + 10} }) before peeking.`;
+                                                    break;
+                                                }
+                                            }
+                                            catch {
+                                                // Bad regex from config — ignore silently. Mint config
+                                                // validation should catch this on load.
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        // Let scroll-triggered animations (fade-in-up, parallax, lazy
-                        // images) settle before we screenshot.
-                        await page.waitForTimeout(450);
-                        const afterY = await page.evaluate(() => window.scrollY);
-                        const delta = afterY - beforeY;
-                        domChanged = delta !== 0;
-                        resultText = delta === 0
-                            ? `Scrolled (${amount}) — but scroll position unchanged (already at edge?). Peek to see what's currently in view.`
-                            : `Scrolled ${delta > 0 ? "down" : "up"} ${Math.abs(delta)}px (now at y=${afterY}). Peek to see what's now in view.`;
-                        steps.push(`Scrolled (${amount}).`);
-                        await captureScreenshot(page, runDir, steps.length);
-                        await input.onScreenshot?.(steps.length);
-                    }
-                    else if (name === "visual_tour") {
-                        const maxViewports = Math.min(Math.max(Number(inp.max_viewports ?? 12), 1), 30);
-                        await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
-                        await page.waitForTimeout(450);
-                        const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
-                        const viewportHeight = await page.evaluate(() => window.innerHeight);
-                        let captured = 0;
-                        let prevY = -1;
-                        for (let i = 0; i < maxViewports; i++) {
-                            steps.push(`visual_tour viewport ${i + 1}/${maxViewports}`);
+                        else if (name === "fill") {
+                            const ref = String(inp.ref ?? "").trim();
+                            const field = String(inp.field ?? "");
+                            const value = String(inp.value ?? "");
+                            if (!ref && !field) {
+                                ok = false;
+                                resultText = `Refused: fill requires either ref or field.`;
+                            }
+                            else {
+                                preHash = await pageStateHash(page);
+                                // Capture rich target of the input BEFORE fill — fills can
+                                // trigger immediate re-renders that unmount the input.
+                                if (ref) {
+                                    targetCapture = await captureRichTarget(page, ref, field).catch(() => undefined);
+                                }
+                                const out = ref ? await fillByRef(page, ref, value) : await fillByLabel(page, field, value);
+                                ok = out.ok;
+                                resultText = out.detail;
+                                if (out.ok) {
+                                    steps.push(out.detail);
+                                    await captureScreenshot(page, runDir, steps.length);
+                                    await input.onScreenshot?.(steps.length);
+                                    postHash = await pageStateHash(page);
+                                    if (stateUnchanged(preHash, postHash).unchanged) {
+                                        resultText += `\n⚠️ No observable effect: page unchanged after fill. Input may already hold this value.`;
+                                    }
+                                }
+                            }
+                        }
+                        else if (name === "press_key") {
+                            const key = String(inp.key ?? "Escape");
+                            preHash = await pageStateHash(page);
+                            await page.keyboard.press(key);
+                            await page.waitForTimeout(300);
+                            resultText = `Pressed ${key}.`;
+                            steps.push(`Pressed ${key}.`);
                             await captureScreenshot(page, runDir, steps.length);
                             await input.onScreenshot?.(steps.length);
-                            captured++;
-                            const y = await page.evaluate(() => window.scrollY);
-                            if (y === prevY)
-                                break;
-                            prevY = y;
-                            await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                            postHash = await pageStateHash(page);
+                            domChanged = !stateUnchanged(preHash, postHash).unchanged;
+                            if (!domChanged) {
+                                resultText += `\n⚠️ No observable effect: page unchanged after pressing ${key}. Don't repeat this key — pick a different action.`;
+                            }
+                        }
+                        else if (name === "scroll") {
+                            const amount = String(inp.amount ?? "page_down");
+                            preHash = await pageStateHash(page);
+                            const beforeY = await page.evaluate(() => window.scrollY);
+                            if (amount === "page_down") {
+                                await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                            }
+                            else if (amount === "page_up") {
+                                await page.evaluate(() => window.scrollBy({ top: -Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                            }
+                            else if (amount === "top") {
+                                await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                            }
+                            else if (amount === "bottom") {
+                                await page.evaluate(() => window.scrollTo({ top: document.documentElement.scrollHeight, left: 0, behavior: "instant" }));
+                            }
+                            else {
+                                const px = Number.parseInt(amount, 10);
+                                if (Number.isFinite(px)) {
+                                    await page.evaluate((p) => window.scrollBy({ top: p, left: 0, behavior: "instant" }), px);
+                                }
+                                else {
+                                    resultText = `Invalid scroll amount "${amount}". Use page_down | page_up | top | bottom | <pixel count>.`;
+                                    steps.push(`Invalid scroll amount.`);
+                                    trace.push({ tool: "scroll", input: inp, ok: false, result: resultText });
+                                    toolResults.push({ type: "tool_result", tool_use_id: b.id, content: resultText });
+                                    continue;
+                                }
+                            }
+                            // Let scroll-triggered animations (fade-in-up, parallax, lazy
+                            // images) settle before we screenshot.
                             await page.waitForTimeout(450);
+                            const afterY = await page.evaluate(() => window.scrollY);
+                            const delta = afterY - beforeY;
+                            domChanged = delta !== 0;
+                            resultText = delta === 0
+                                ? `Scrolled (${amount}) — but scroll position unchanged (already at edge?). Peek to see what's currently in view.`
+                                : `Scrolled ${delta > 0 ? "down" : "up"} ${Math.abs(delta)}px (now at y=${afterY}). Peek to see what's now in view.`;
+                            steps.push(`Scrolled (${amount}).`);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                            postHash = await pageStateHash(page);
                         }
-                        resultText = `visual_tour complete: captured ${captured} viewports of a ${pageHeight}px tall page (viewport ${viewportHeight}px). All shots saved as step artifacts and will appear in the PR comment. Now call complete with a summary of the visual review.`;
-                    }
-                    else if (name === "assert_visible") {
-                        const text = String(inp.text ?? "");
-                        const timeout = Number(inp.timeoutMs ?? 20_000);
-                        const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout }).catch(() => false);
-                        ok = found;
-                        resultText = found ? `Text "${text}" is visible.` : `Text "${text}" did NOT appear within ${timeout}ms.`;
-                        steps.push(found ? `Asserted "${text}" is visible.` : `Could not verify "${text}".`);
-                        await captureScreenshot(page, runDir, steps.length);
-                        await input.onScreenshot?.(steps.length);
-                        // Update the progress tracker. Two ways an assert_visible can
-                        // satisfy a criterion:
-                        //  (a) POSITIVE: the asserted text appeared, and overlaps with
-                        //      the criterion text (substring either direction).
-                        //  (b) NEGATIVE: the criterion describes absence ("X is no longer
-                        //      visible", "X is gone", "X disappeared", "X was removed",
-                        //      "X is closed"). In that case, an assert_visible that
-                        //      TIMED OUT on the negated subject counts as confirmation
-                        //      that the absence holds — the agent has affirmatively
-                        //      verified the state.
-                        const tLower = text.toLowerCase();
-                        const NEGATION_RE = /(no longer (visible|present|shown)|is gone|is hidden|isn'?t visible|is not visible|disappear(ed|s)|was removed|is removed|is closed|is dismissed|has closed)/i;
-                        for (const crit of input.successCriteria) {
-                            if (passedCriteria.has(crit))
-                                continue;
-                            const cLower = crit.toLowerCase();
-                            const positiveMatch = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 30));
-                            const isNegativeCrit = NEGATION_RE.test(crit);
-                            const negativeMatch = !found && isNegativeCrit && cLower.includes(tLower);
-                            if ((found && positiveMatch) || negativeMatch) {
-                                passedCriteria.add(crit);
-                                resultText += `\n✓ Marked success criterion as DONE: "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                        else if (name === "visual_tour") {
+                            const maxViewports = Math.min(Math.max(Number(inp.max_viewports ?? 12), 1), 30);
+                            await page.evaluate(() => window.scrollTo({ top: 0, left: 0, behavior: "instant" }));
+                            await page.waitForTimeout(450);
+                            const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+                            const viewportHeight = await page.evaluate(() => window.innerHeight);
+                            let captured = 0;
+                            let prevY = -1;
+                            for (let i = 0; i < maxViewports; i++) {
+                                steps.push(`visual_tour viewport ${i + 1}/${maxViewports}`);
+                                await captureScreenshot(page, runDir, steps.length);
+                                await input.onScreenshot?.(steps.length);
+                                captured++;
+                                const y = await page.evaluate(() => window.scrollY);
+                                if (y === prevY)
+                                    break;
+                                prevY = y;
+                                await page.evaluate(() => window.scrollBy({ top: Math.floor(window.innerHeight * 0.9), left: 0, behavior: "instant" }));
+                                await page.waitForTimeout(450);
                             }
+                            resultText = `visual_tour complete: captured ${captured} viewports of a ${pageHeight}px tall page (viewport ${viewportHeight}px). All shots saved as step artifacts and will appear in the PR comment. Now call complete with a summary of the visual review.`;
                         }
-                        // If this assert produced a not-found AND no negative criterion
-                        // matched it, surface a hint so the agent doesn't keep guessing.
-                        if (!found) {
-                            const negCrits = input.successCriteria.filter((c) => NEGATION_RE.test(c) && !passedCriteria.has(c));
-                            if (negCrits.length > 0) {
-                                resultText += `\n💡 Tip: a not-found assertion can satisfy a NEGATIVE criterion (one containing "no longer visible", "is gone", etc.) — but only if its text overlaps with the criterion's subject. Pending negative criteria: ${negCrits.map((c) => `"${c.slice(0, 60)}…"`).join("; ")}.`;
-                            }
-                        }
-                    }
-                    else if (name === "count_check") {
-                        const text = String(inp.text ?? "");
-                        const minCount = Number(inp.minCount ?? 1);
-                        // ROW-SCOPED count: only count row-like elements (table rows, list
-                        // items, role=row, role=listitem) that contain the text. This
-                        // avoids false positives where the text appears in UI chrome
-                        // (headers, tabs, titles, subtitle counts). Page-scoped count is
-                        // kept as a fallback diagnostic.
-                        const rowSelector = 'tr, [role="row"], li, [role="listitem"]';
-                        const rowScopeCount = await page
-                            .locator(rowSelector)
-                            .filter({ hasText: text })
-                            .count()
-                            .catch(() => 0);
-                        const pageScopeCount = await page.getByText(text, { exact: false }).count().catch(() => 0);
-                        const usedCount = rowScopeCount > 0 ? rowScopeCount : pageScopeCount;
-                        const scopeNote = rowScopeCount > 0
-                            ? `row-scoped`
-                            : pageScopeCount > 0
-                                ? `page-scoped (no row-like ancestors matched — likely chrome: header/tab/title)`
-                                : `none`;
-                        ok = usedCount >= minCount;
-                        resultText = ok
-                            ? `Found ${usedCount} element(s) containing "${text}" (≥ ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`
-                            : `Found only ${usedCount} element(s) containing "${text}" (< ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`;
-                        steps.push(ok ? `Counted ${usedCount} of "${text}" (≥${minCount}, ${scopeNote}).` : `Insufficient "${text}" count (${usedCount}/${minCount}).`);
-                        await captureScreenshot(page, runDir, steps.length);
-                        await input.onScreenshot?.(steps.length);
-                        // Build the observation. We'll fill in matchedQuantityIndices
-                        // below if this measurement satisfies a synthesized "At least N X"
-                        // criterion for one of the user-stated quantities.
-                        const observation = {
-                            text,
-                            rowScopeCount,
-                            pageScopeCount,
-                            atStep: steps.length,
-                            matchedQuantityIndices: []
-                        };
-                        // Quantity matcher: a criterion like "3 X are visible" or "exactly
-                        // 3 X" or "at least 3 X" is DONE when count >= the number in the
-                        // criterion AND the searched text overlaps with the criterion's
-                        // noun. Uses row-scoped count for matching to avoid chrome
-                        // false positives.
-                        if (ok) {
+                        else if (name === "assert_visible") {
+                            const text = String(inp.text ?? "");
+                            const timeout = Number(inp.timeoutMs ?? 20_000);
+                            const found = await page.getByText(text, { exact: false }).first().isVisible({ timeout }).catch(() => false);
+                            ok = found;
+                            resultText = found ? `Text "${text}" is visible.` : `Text "${text}" did NOT appear within ${timeout}ms.`;
+                            steps.push(found ? `Asserted "${text}" is visible.` : `Could not verify "${text}".`);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                            // Update the progress tracker. Two ways an assert_visible can
+                            // satisfy a criterion:
+                            //  (a) POSITIVE: the asserted text appeared, and overlaps with
+                            //      the criterion text (substring either direction).
+                            //  (b) NEGATIVE: the criterion describes absence ("X is no longer
+                            //      visible", "X is gone", "X disappeared", "X was removed",
+                            //      "X is closed"). In that case, an assert_visible that
+                            //      TIMED OUT on the negated subject counts as confirmation
+                            //      that the absence holds — the agent has affirmatively
+                            //      verified the state.
                             const tLower = text.toLowerCase();
+                            const NEGATION_RE = /(no longer (visible|present|shown)|is gone|is hidden|isn'?t visible|is not visible|disappear(ed|s)|was removed|is removed|is closed|is dismissed|has closed)/i;
                             for (const crit of input.successCriteria) {
                                 if (passedCriteria.has(crit))
                                     continue;
                                 const cLower = crit.toLowerCase();
-                                const numMatch = cLower.match(/(?:at least\s+|exactly\s+|≥\s*|>=\s*)?(\d+)/);
-                                const required = numMatch ? Number(numMatch[1]) : null;
-                                const textOverlap = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 20));
-                                if (required !== null && usedCount >= required && textOverlap) {
+                                const positiveMatch = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 30));
+                                const isNegativeCrit = NEGATION_RE.test(crit);
+                                const negativeMatch = !found && isNegativeCrit && cLower.includes(tLower);
+                                if ((found && positiveMatch) || negativeMatch) {
                                     passedCriteria.add(crit);
-                                    resultText += `\n✓ Marked success criterion as DONE (count ${usedCount} ≥ ${required}): "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                                    resultText += `\n✓ Marked success criterion as DONE: "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                                }
+                            }
+                            // If this assert produced a not-found AND no negative criterion
+                            // matched it, surface a hint so the agent doesn't keep guessing.
+                            if (!found) {
+                                const negCrits = input.successCriteria.filter((c) => NEGATION_RE.test(c) && !passedCriteria.has(c));
+                                if (negCrits.length > 0) {
+                                    resultText += `\n💡 Tip: a not-found assertion can satisfy a NEGATIVE criterion (one containing "no longer visible", "is gone", etc.) — but only if its text overlaps with the criterion's subject. Pending negative criteria: ${negCrits.map((c) => `"${c.slice(0, 60)}…"`).join("; ")}.`;
                                 }
                             }
                         }
-                        // Direct association with user-stated quantities. If THIS
-                        // count_check call satisfies the "At least N <subject>" pattern
-                        // for a quantity (by value AND subject overlap with the criterion
-                        // line), tag the observation with that quantity's index. The PR
-                        // comment renderer prefers tagged observations over noun-matching
-                        // at render time — much more reliable.
-                        (input.userStatedQuantities ?? []).forEach((q, idx) => {
-                            if (!ok || usedCount < q.value)
-                                return;
-                            const subjLower = q.subject.toLowerCase();
-                            const tLower = text.toLowerCase();
-                            const subjectSignificantWords = subjLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
-                            const textSignificantWords = tLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
-                            const nounOverlap = subjectSignificantWords.some((w) => textSignificantWords.some((tw) => tw.includes(w) || w.includes(tw)));
-                            // OR: the agent measured something row-scoped with high count —
-                            // accept it as evidence of "this kind of row exists" when the
-                            // user's stated subject is a row-noun (rows, items, articles,
-                            // entries). For "3 rows", any high row-scoped count of a
-                            // per-row datum (date, status) counts.
-                            const isRowNoun = /\b(rows?|items?|entries|results?|records?|articles?)\b/.test(subjLower);
-                            if (nounOverlap || (isRowNoun && rowScopeCount >= q.value)) {
-                                observation.matchedQuantityIndices.push(idx);
+                        else if (name === "count_check") {
+                            const text = String(inp.text ?? "");
+                            const minCount = Number(inp.minCount ?? 1);
+                            // ROW-SCOPED count: only count row-like elements (table rows, list
+                            // items, role=row, role=listitem) that contain the text. This
+                            // avoids false positives where the text appears in UI chrome
+                            // (headers, tabs, titles, subtitle counts). Page-scoped count is
+                            // kept as a fallback diagnostic.
+                            const rowSelector = 'tr, [role="row"], li, [role="listitem"]';
+                            const rowScopeCount = await page
+                                .locator(rowSelector)
+                                .filter({ hasText: text })
+                                .count()
+                                .catch(() => 0);
+                            const pageScopeCount = await page.getByText(text, { exact: false }).count().catch(() => 0);
+                            const usedCount = rowScopeCount > 0 ? rowScopeCount : pageScopeCount;
+                            const scopeNote = rowScopeCount > 0
+                                ? `row-scoped`
+                                : pageScopeCount > 0
+                                    ? `page-scoped (no row-like ancestors matched — likely chrome: header/tab/title)`
+                                    : `none`;
+                            ok = usedCount >= minCount;
+                            resultText = ok
+                                ? `Found ${usedCount} element(s) containing "${text}" (≥ ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`
+                                : `Found only ${usedCount} element(s) containing "${text}" (< ${minCount} required, ${scopeNote}). [row=${rowScopeCount}, page=${pageScopeCount}]`;
+                            steps.push(ok ? `Counted ${usedCount} of "${text}" (≥${minCount}, ${scopeNote}).` : `Insufficient "${text}" count (${usedCount}/${minCount}).`);
+                            await captureScreenshot(page, runDir, steps.length);
+                            await input.onScreenshot?.(steps.length);
+                            // Build the observation. We'll fill in matchedQuantityIndices
+                            // below if this measurement satisfies a synthesized "At least N X"
+                            // criterion for one of the user-stated quantities.
+                            const observation = {
+                                text,
+                                rowScopeCount,
+                                pageScopeCount,
+                                atStep: steps.length,
+                                matchedQuantityIndices: []
+                            };
+                            // Quantity matcher: a criterion like "3 X are visible" or "exactly
+                            // 3 X" or "at least 3 X" is DONE when count >= the number in the
+                            // criterion AND the searched text overlaps with the criterion's
+                            // noun. Uses row-scoped count for matching to avoid chrome
+                            // false positives.
+                            if (ok) {
+                                const tLower = text.toLowerCase();
+                                for (const crit of input.successCriteria) {
+                                    if (passedCriteria.has(crit))
+                                        continue;
+                                    const cLower = crit.toLowerCase();
+                                    const numMatch = cLower.match(/(?:at least\s+|exactly\s+|≥\s*|>=\s*)?(\d+)/);
+                                    const required = numMatch ? Number(numMatch[1]) : null;
+                                    const textOverlap = cLower.includes(tLower) || tLower.includes(cLower.slice(0, 20));
+                                    if (required !== null && usedCount >= required && textOverlap) {
+                                        passedCriteria.add(crit);
+                                        resultText += `\n✓ Marked success criterion as DONE (count ${usedCount} ≥ ${required}): "${crit.slice(0, 80)}${crit.length > 80 ? "…" : ""}"`;
+                                    }
+                                }
                             }
-                        });
-                        quantitativeObservations.push(observation);
-                    }
-                    else if (name === "complete") {
-                        const status = inp.status ?? "blocked";
-                        const summary = String(inp.summary ?? "");
-                        // Hard gate: passed requires every success criterion to be [✓ DONE].
-                        // Without this, the agent can declare success on the intent (e.g.,
-                        // "clicked Schedule Articles, modal advanced") without verifying
-                        // the END state the user actually asked for ("3 new rows appear
-                        // on the dashboard"). Refusing here forces the agent to keep
-                        // going until the literal post-state is observable.
-                        //
-                        // Escape valve: criteria_evidence allows the agent to attest a
-                        // criterion the substring matcher missed (semantic overlap). Each
-                        // entry must include a verbatim ≥15-char quote that appears in
-                        // the last 3 peek/assert results. If validated, the criterion is
-                        // marked DONE.
-                        if (status === "passed") {
-                            // Process criteria_evidence first.
-                            const evidence = Array.isArray(inp.criteria_evidence) ? inp.criteria_evidence : [];
-                            const recentResults = trace.slice(-3).map((t) => String(t.result ?? "")).join("\n").toLowerCase();
-                            const attestNotes = [];
-                            for (const e of evidence) {
-                                const idx = Number(e?.criterion_index ?? 0) - 1;
-                                const quote = String(e?.observation_quote ?? "").trim();
-                                if (idx < 0 || idx >= input.successCriteria.length) {
-                                    attestNotes.push(`Rejected: criterion_index ${e?.criterion_index} out of range (1..${input.successCriteria.length}).`);
-                                    continue;
+                            // Direct association with user-stated quantities. If THIS
+                            // count_check call satisfies the "At least N <subject>" pattern
+                            // for a quantity (by value AND subject overlap with the criterion
+                            // line), tag the observation with that quantity's index. The PR
+                            // comment renderer prefers tagged observations over noun-matching
+                            // at render time — much more reliable.
+                            (input.userStatedQuantities ?? []).forEach((q, idx) => {
+                                if (!ok || usedCount < q.value)
+                                    return;
+                                const subjLower = q.subject.toLowerCase();
+                                const tLower = text.toLowerCase();
+                                const subjectSignificantWords = subjLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
+                                const textSignificantWords = tLower.split(/[\s\-_]+/).filter((w) => w.length >= 3);
+                                const nounOverlap = subjectSignificantWords.some((w) => textSignificantWords.some((tw) => tw.includes(w) || w.includes(tw)));
+                                // OR: the agent measured something row-scoped with high count —
+                                // accept it as evidence of "this kind of row exists" when the
+                                // user's stated subject is a row-noun (rows, items, articles,
+                                // entries). For "3 rows", any high row-scoped count of a
+                                // per-row datum (date, status) counts.
+                                const isRowNoun = /\b(rows?|items?|entries|results?|records?|articles?)\b/.test(subjLower);
+                                if (nounOverlap || (isRowNoun && rowScopeCount >= q.value)) {
+                                    observation.matchedQuantityIndices.push(idx);
                                 }
-                                if (quote.length < 15) {
-                                    attestNotes.push(`Rejected criterion ${e?.criterion_index}: observation_quote must be ≥15 chars (got ${quote.length}).`);
-                                    continue;
+                            });
+                            quantitativeObservations.push(observation);
+                        }
+                        else if (name === "wait_for_progress") {
+                            // Async-action wait. Polls the page hash + (optionally) text/
+                            // selector visibility, exiting early when the condition is met.
+                            // Per-run budget cap prevents the agent from burning the entire
+                            // turn budget on waits (max 180s aggregate).
+                            const reason = String(inp.reason ?? "").slice(0, 200);
+                            const requested = Number(inp.timeoutSec ?? 15);
+                            const timeoutSec = Math.max(1, Math.min(120, Number.isFinite(requested) ? requested : 15));
+                            const remaining = MAX_WAIT_BUDGET_MS - waitBudgetUsedMs;
+                            if (remaining <= 0) {
+                                ok = false;
+                                resultText = `Refused wait_for_progress: this run has already spent the per-run wait budget (${Math.round(MAX_WAIT_BUDGET_MS / 1000)}s). The page is probably stuck — peek + try a different action, or call complete(blocked).`;
+                            }
+                            else {
+                                const effectiveBudget = Math.min(timeoutSec * 1000, remaining);
+                                const until = inp.until ?? { kind: "dom_change" };
+                                const deadline = Date.now() + effectiveBudget;
+                                const start = Date.now();
+                                const beforeHash = await pageStateHash(page);
+                                // network_idle: track in-flight requests using event listeners,
+                                // require a quiet window of idleMs (default 500ms).
+                                let networkInFlight = 0;
+                                let lastRequestEnd = Date.now();
+                                const idleMs = Math.max(100, Number(until.idleMs ?? 500));
+                                const onReq = () => { networkInFlight++; };
+                                const onResp = () => { networkInFlight = Math.max(0, networkInFlight - 1); lastRequestEnd = Date.now(); };
+                                if (until.kind === "network_idle") {
+                                    page.on("request", onReq);
+                                    page.on("requestfinished", onResp);
+                                    page.on("requestfailed", onResp);
                                 }
-                                const crit = input.successCriteria[idx];
-                                if (passedCriteria.has(crit))
-                                    continue; // already done
-                                if (recentResults.includes(quote.toLowerCase())) {
-                                    passedCriteria.add(crit);
-                                    attestNotes.push(`✓ Attested criterion ${idx + 1} DONE via quote: "${quote.slice(0, 60)}…"`);
+                                let satisfied = false;
+                                try {
+                                    while (Date.now() < deadline) {
+                                        await page.waitForTimeout(400);
+                                        if (until.kind === "text_appears" && until.text) {
+                                            const v = await page.getByText(until.text, { exact: false }).first().isVisible({ timeout: 100 }).catch(() => false);
+                                            if (v) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                        else if (until.kind === "text_disappears" && until.text) {
+                                            const v = await page.getByText(until.text, { exact: false }).first().isVisible({ timeout: 100 }).catch(() => false);
+                                            if (!v) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                        else if (until.kind === "selector_appears" && until.selector) {
+                                            const v = await page.locator(until.selector).first().isVisible({ timeout: 100 }).catch(() => false);
+                                            if (v) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                        else if (until.kind === "network_idle") {
+                                            if (networkInFlight === 0 && Date.now() - lastRequestEnd >= idleMs) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                        else {
+                                            // dom_change (default).
+                                            const cur = await pageStateHash(page);
+                                            if (!stateUnchanged(beforeHash, cur).unchanged) {
+                                                satisfied = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                finally {
+                                    if (until.kind === "network_idle") {
+                                        page.off("request", onReq);
+                                        page.off("requestfinished", onResp);
+                                        page.off("requestfailed", onResp);
+                                    }
+                                }
+                                const elapsed = Date.now() - start;
+                                waitBudgetUsedMs += elapsed;
+                                ok = satisfied;
+                                if (satisfied) {
+                                    resultText = `wait_for_progress satisfied (${until.kind ?? "dom_change"}) after ${Math.round(elapsed / 100) / 10}s. ${reason ? `Reason: ${reason}.` : ""}`;
+                                    steps.push(`Waited ${Math.round(elapsed / 100) / 10}s — ${until.kind ?? "dom_change"} reached.`);
                                 }
                                 else {
-                                    attestNotes.push(`Rejected criterion ${e?.criterion_index}: observation_quote "${quote.slice(0, 60)}…" NOT found in last 3 tool results. Quote verbatim text from a peek/assert you actually ran.`);
+                                    // S1 risk #5 mitigation: timing-out a wait_for_progress means
+                                    // the action we were waiting on never landed. Lock the
+                                    // related criterion against attestation — the agent can't
+                                    // recover this via verbatim-quote attestation later.
+                                    const lockedIdx = lockMatchingCriterion(input.successCriteria, reason, attestationLocks);
+                                    resultText = `wait_for_progress TIMED OUT after ${Math.round(elapsed / 100) / 10}s without the condition (${until.kind ?? "dom_change"}) being met. ${reason ? `Reason: ${reason}.` : ""}\n⚠️ Criterion${lockedIdx >= 0 ? ` #${lockedIdx + 1}` : ""} associated with this wait is now LOCKED against attestation. If you can't get this to satisfy via a real action, call complete(blocked).`;
+                                    steps.push(`Wait timed out (${Math.round(elapsed / 100) / 10}s).`);
                                 }
                             }
-                            // Extra hard gate: if userStatedQuantities exist, EACH must
-                            // have been measured via count_check. We check by looking for
-                            // any observation whose `text` overlaps with the quantity's
-                            // subject. Without this, the agent can claim "criteria met"
-                            // and skip the actual measurement — losing the divergence
-                            // signal users need.
-                            const quantitiesPendingMeasurement = [];
-                            for (const q of input.userStatedQuantities ?? []) {
-                                const subjLower = q.subject.toLowerCase();
-                                const measured = quantitativeObservations.some((o) => {
-                                    const tLower = o.text.toLowerCase();
-                                    return subjLower.includes(tLower) || tLower.includes(subjLower.split(/\s+/)[0] ?? "");
+                        }
+                        else if (name === "wait_for_dom_stable") {
+                            const reason = String(inp.reason ?? "").slice(0, 200);
+                            const quietMs = Math.max(100, Math.min(10_000, Number(inp.quietMs ?? 1500)));
+                            const requested = Number(inp.timeoutSec ?? 10);
+                            const timeoutSec = Math.max(1, Math.min(60, Number.isFinite(requested) ? requested : 10));
+                            const remaining = MAX_WAIT_BUDGET_MS - waitBudgetUsedMs;
+                            if (remaining <= 0) {
+                                ok = false;
+                                resultText = `Refused wait_for_dom_stable: per-run wait budget exhausted (${Math.round(MAX_WAIT_BUDGET_MS / 1000)}s). Peek and try a different action.`;
+                            }
+                            else {
+                                const start = Date.now();
+                                const effectiveBudget = Math.min(timeoutSec * 1000, remaining);
+                                const deadline = start + effectiveBudget;
+                                let prev = await pageStateHash(page);
+                                let lastChange = Date.now();
+                                let satisfied = false;
+                                while (Date.now() < deadline) {
+                                    await page.waitForTimeout(Math.min(400, Math.max(100, Math.floor(quietMs / 4))));
+                                    const now = await pageStateHash(page);
+                                    // We compare the RAW (unnormalized) hash here: this tool's
+                                    // job is "is the DOM literally stable?", so a ticking clock
+                                    // or rotating timestamp DOES count as churn even though it
+                                    // doesn't change the semantic snapshot. Without this, an
+                                    // animated counter like setInterval(..., 100) reads as
+                                    // stable because every individual number collapses to <NUM>.
+                                    if (now.bodyHashRaw && prev.bodyHashRaw && now.bodyHashRaw === prev.bodyHashRaw && now.url === prev.url) {
+                                        if (Date.now() - lastChange >= quietMs) {
+                                            satisfied = true;
+                                            break;
+                                        }
+                                    }
+                                    else {
+                                        lastChange = Date.now();
+                                        prev = now;
+                                    }
+                                }
+                                const elapsed = Date.now() - start;
+                                waitBudgetUsedMs += elapsed;
+                                ok = satisfied;
+                                resultText = satisfied
+                                    ? `wait_for_dom_stable satisfied: DOM was quiet for ${quietMs}ms (total wait ${Math.round(elapsed / 100) / 10}s). ${reason ? `Reason: ${reason}.` : ""}`
+                                    : `wait_for_dom_stable timed out after ${Math.round(elapsed / 100) / 10}s; the DOM is still churning. ${reason ? `Reason: ${reason}.` : ""}`;
+                                steps.push(satisfied ? `DOM stable (${quietMs}ms quiet).` : `DOM still churning after ${Math.round(elapsed / 100) / 10}s.`);
+                            }
+                        }
+                        else if (name === "complete") {
+                            const status = inp.status ?? "blocked";
+                            const summary = String(inp.summary ?? "");
+                            // Hard gate: passed requires every success criterion to be [✓ DONE].
+                            // Without this, the agent can declare success on the intent (e.g.,
+                            // "clicked Schedule Articles, modal advanced") without verifying
+                            // the END state the user actually asked for ("3 new rows appear
+                            // on the dashboard"). Refusing here forces the agent to keep
+                            // going until the literal post-state is observable.
+                            //
+                            // Escape valve: criteria_evidence allows the agent to attest at
+                            // most ONE criterion the auto-marker missed. Each entry passes
+                            // three gates: provenance (quote must trace to a peek or to a
+                            // successful assert_visible), Jaccard (quote can't be a near-
+                            // copy of the criterion text), and cap (only 1 attestation per
+                            // complete() call). Any rejection refuses the entire complete()
+                            // — accepted entries are NOT applied to passedCriteria when
+                            // there's a co-rejected entry in the same batch (avoids
+                            // side-effects leaking from refused calls). See
+                            // `validateAttestation` above for the full rule set + rationale.
+                            if (status === "passed") {
+                                const evidence = Array.isArray(inp.criteria_evidence) ? inp.criteria_evidence : [];
+                                const { isLocked } = await __nccwpck_require__.e(/* import() */ 862).then(__nccwpck_require__.bind(__nccwpck_require__, 1862));
+                                const attestation = validateAttestation({
+                                    evidence,
+                                    successCriteria: input.successCriteria,
+                                    trace: trace.map((t) => ({ tool: t.tool, ok: t.ok, result: t.result })),
+                                    alreadyPassedCriteria: passedCriteria,
+                                    runId,
+                                    isLocked: (idx) => isLocked(runId, idx)
                                 });
-                                if (!measured)
-                                    quantitiesPendingMeasurement.push({ value: q.value, subject: q.subject });
-                            }
-                            const pending = input.successCriteria.filter((c) => !passedCriteria.has(c));
-                            if (pending.length === 0 && quantitiesPendingMeasurement.length > 0) {
-                                ok = false;
-                                resultText = `Refused complete(passed): all criteria checked, but ${quantitiesPendingMeasurement.length} user-stated quantity/quantities haven't been measured with count_check yet. The PR comment needs these numbers to surface intent vs reality divergence.\n\nUnmeasured:\n${quantitiesPendingMeasurement.map((q, i) => `  ${i + 1}. ${q.value} ${q.subject}`).join("\n")}\n\nCall count_check(text=<row-substring of the subject>, minCount=<user's number>) for each, then retry complete(passed).`;
-                            }
-                            else if (pending.length > 0) {
-                                ok = false;
-                                const pendingIdxList = input.successCriteria
-                                    .map((c, i) => ({ c, i }))
-                                    .filter(({ c }) => !passedCriteria.has(c))
-                                    .map(({ c, i }) => `  ${i + 1}. ${c}`)
-                                    .join("\n");
-                                const attestBlock = attestNotes.length ? `\n\nAttestation results:\n${attestNotes.join("\n")}` : "";
-                                resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending (1-based index):\n${pendingIdxList}${attestBlock}\n\nOptions:\n  1) Continue the flow + assert_visible against the criterion's literal END state.\n  2) If a criterion is genuinely satisfied but the matcher's substring rule missed it, retry complete(passed) with criteria_evidence=[{criterion_index: N, observation_quote: "<15+ char verbatim text from your most recent peek or assert>"}] — be SPECIFIC.\n  3) If you cannot reach the end state, call complete(status="blocked", summary=...) or complete(status="failed", summary=...).`;
+                                // Telemetry: log every rejection so we can measure historical
+                                // false-pass rate and tune the rules. Format is grep-friendly:
+                                //   [mint:attestation_rejected] runId=<id> criterion=<i> reason=<provenance|jaccard|cap> quote_preview=<first 60 chars>
+                                for (const r of attestation.rejected) {
+                                    console.log(`[mint:attestation_rejected] runId=${runId} criterion=${r.criterionIndex ?? "?"} reason=${r.reason} quote_preview=${r.quotePreview.replace(/\n/g, " ")}`);
+                                }
+                                // If ANY entry was rejected, the entire complete() refuses —
+                                // even if other entries in the batch were valid. The agent
+                                // gets a clean retry; passedCriteria is NOT mutated by this
+                                // call (the rejected entry might have hidden an integrity
+                                // issue we don't want to launder by partially applying).
+                                if (attestation.rejected.length > 0) {
+                                    ok = false;
+                                    const lines = attestation.rejected.map((r) => `  - ${r.message}`).join("\n");
+                                    resultText = `Refused complete(passed): ${attestation.rejected.length} attestation(s) rejected. No criteria were marked DONE by this call — the page-evidence pathway (assert_visible / count_check) is the right way to verify each remaining criterion.\n\n${lines}\n\nRetry options:\n  1) Best: call assert_visible(text="<distinctive end-state text from the page>") OR count_check(text=…, minCount=…) for each pending criterion. Those auto-mark DONE and need no attestation at all.\n  2) If — and only if — the auto-marker truly missed semantic overlap, retry complete(passed) with at most ${MAX_ATTESTATIONS_PER_COMPLETE} entry, quoting verbatim text from a RECENT peek or a SUCCESSFUL assert_visible (NOT from your own failed asserts, errors, or refusals).`;
+                                    trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 4000), domChanged });
+                                    toolResults.push({
+                                        type: "tool_result",
+                                        tool_use_id: b.id,
+                                        content: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText,
+                                        is_error: true
+                                    });
+                                    continue;
+                                }
+                                // No rejections — apply accepted entries to the progress
+                                // tracker so the pending-criteria check below sees them.
+                                const attestNotes = [];
+                                for (const a of attestation.accepted) {
+                                    if (passedCriteria.has(a.criterion))
+                                        continue;
+                                    passedCriteria.add(a.criterion);
+                                    attestNotes.push(`✓ Attested criterion ${a.criterionIndex} DONE via quote: "${a.quote.slice(0, 60)}${a.quote.length > 60 ? "…" : ""}"`);
+                                }
+                                // Extra hard gate: if userStatedQuantities exist, EACH must
+                                // have been measured via count_check. We check by looking for
+                                // any observation whose `text` overlaps with the quantity's
+                                // subject. Without this, the agent can claim "criteria met"
+                                // and skip the actual measurement — losing the divergence
+                                // signal users need.
+                                const quantitiesPendingMeasurement = [];
+                                for (const q of input.userStatedQuantities ?? []) {
+                                    const subjLower = q.subject.toLowerCase();
+                                    const measured = quantitativeObservations.some((o) => {
+                                        const tLower = o.text.toLowerCase();
+                                        return subjLower.includes(tLower) || tLower.includes(subjLower.split(/\s+/)[0] ?? "");
+                                    });
+                                    if (!measured)
+                                        quantitiesPendingMeasurement.push({ value: q.value, subject: q.subject });
+                                }
+                                const pending = input.successCriteria.filter((c) => !passedCriteria.has(c));
+                                if (pending.length === 0 && quantitiesPendingMeasurement.length > 0) {
+                                    ok = false;
+                                    resultText = `Refused complete(passed): all criteria checked, but ${quantitiesPendingMeasurement.length} user-stated quantity/quantities haven't been measured with count_check yet. The PR comment needs these numbers to surface intent vs reality divergence.\n\nUnmeasured:\n${quantitiesPendingMeasurement.map((q, i) => `  ${i + 1}. ${q.value} ${q.subject}`).join("\n")}\n\nCall count_check(text=<row-substring of the subject>, minCount=<user's number>) for each, then retry complete(passed).`;
+                                }
+                                else if (pending.length > 0) {
+                                    ok = false;
+                                    const pendingIdxList = input.successCriteria
+                                        .map((c, i) => ({ c, i }))
+                                        .filter(({ c }) => !passedCriteria.has(c))
+                                        .map(({ c, i }) => `  ${i + 1}. ${c}`)
+                                        .join("\n");
+                                    const attestBlock = attestNotes.length ? `\n\nAttestation results:\n${attestNotes.join("\n")}` : "";
+                                    resultText = `Refused complete(passed): ${pending.length} criterion/criteria still unverified.\n\nPending (1-based index):\n${pendingIdxList}${attestBlock}\n\nOptions:\n  1) Continue the flow + assert_visible against the criterion's literal END state.\n  2) If a criterion is genuinely satisfied but the matcher's substring rule missed it, retry complete(passed) with criteria_evidence=[{criterion_index: N, observation_quote: "<15+ char verbatim text from your most recent peek or assert>"}] — be SPECIFIC.\n  3) If you cannot reach the end state, call complete(status="blocked", summary=...) or complete(status="failed", summary=...).`;
+                                }
+                                else {
+                                    verdict = { status, summary, toolCalls, turns, trace, quantitativeObservations };
+                                    const attestBlock = attestNotes.length ? ` (${attestNotes.length} attestation(s))` : "";
+                                    resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified)${attestBlock}.`;
+                                }
                             }
                             else {
                                 verdict = { status, summary, toolCalls, turns, trace, quantitativeObservations };
-                                const attestBlock = attestNotes.length ? ` (${attestNotes.length} attestation(s))` : "";
-                                resultText = `Run marked passed (all ${input.successCriteria.length} criteria verified)${attestBlock}.`;
+                                resultText = `Run marked ${status}.`;
                             }
                         }
                         else {
-                            verdict = { status, summary, toolCalls, turns, trace, quantitativeObservations };
-                            resultText = `Run marked ${status}.`;
+                            ok = false;
+                            resultText = `Unknown tool "${name}".`;
                         }
                     }
-                    else {
+                    catch (err) {
                         ok = false;
-                        resultText = `Unknown tool "${name}".`;
+                        resultText = `Tool ${name} threw: ${err instanceof Error ? err.message : String(err)}`;
                     }
+                    trace.push({
+                        tool: name,
+                        input: inp,
+                        ok,
+                        result: resultText.slice(0, 4000),
+                        domChanged,
+                        pre_hash: preHash,
+                        post_hash: postHash,
+                        target: targetCapture
+                    });
+                    toolResults.push({
+                        type: "tool_result",
+                        tool_use_id: b.id,
+                        content: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText,
+                        is_error: !ok
+                    });
                 }
-                catch (err) {
-                    ok = false;
-                    resultText = `Tool ${name} threw: ${err instanceof Error ? err.message : String(err)}`;
-                }
-                trace.push({ tool: name, input: inp, ok, result: resultText.slice(0, 4000), domChanged });
-                toolResults.push({
-                    type: "tool_result",
-                    tool_use_id: b.id,
-                    content: resultText.length > 8000 ? resultText.slice(0, 8000) + "\n…(truncated)" : resultText,
-                    is_error: !ok
-                });
             }
-        }
-        if (verdict)
-            break;
-        // Repetition guard: feed the turn's last tool call to the guard.
-        // We pick the LAST tool_use in the response (the agent often emits a
-        // peek + an action in the same turn; the action is the one that
-        // matters for loop detection). The guard decides whether to nudge
-        // the agent next turn or abort with what we've got.
-        if (trace.length > 0) {
-            const last = trace[trace.length - 1];
-            const inputAny = last.input;
-            const targetId = String(inputAny.elementId ?? inputAny.selector ?? inputAny.path ?? inputAny.text ?? "") || undefined;
-            // Handlers that touch the page set `last.domChanged` from a real
-            // before/after pageStateHash comparison. Reads (peek/observe) and
-            // fills leave it undefined, which the guard's `isStagnated` filter
-            // treats as "not an action — don't count." The previous version
-            // tried to derive this from a regex on the result string, but the
-            // regex almost never matched real result text, so every signup
-            // flow tripped the guard around tool call 8 regardless of whether
-            // it was actually stuck.
-            const decision = guard.check({
-                tool: last.tool,
-                targetId,
-                domChanged: last.domChanged,
-                ok: last.ok
-            });
-            if (decision.kind === "abort_with_partial") {
+            if (verdict)
+                break;
+            // Repetition guard: feed the turn's last tool call to the guard.
+            // We pick the LAST tool_use in the response (the agent often emits a
+            // peek + an action in the same turn; the action is the one that
+            // matters for loop detection). The guard decides whether to nudge
+            // the agent next turn or abort with what we've got.
+            if (trace.length > 0) {
+                const last = trace[trace.length - 1];
+                const inputAny = last.input;
+                const targetId = String(inputAny.elementId ?? inputAny.selector ?? inputAny.path ?? inputAny.text ?? "") || undefined;
+                // Handlers that touch the page set `last.domChanged` from a real
+                // before/after pageStateHash comparison. Reads (peek/observe) and
+                // fills leave it undefined, which the guard's `isStagnated` filter
+                // treats as "not an action — don't count." The previous version
+                // tried to derive this from a regex on the result string, but the
+                // regex almost never matched real result text, so every signup
+                // flow tripped the guard around tool call 8 regardless of whether
+                // it was actually stuck.
+                const decision = guard.check({
+                    tool: last.tool,
+                    targetId,
+                    domChanged: last.domChanged,
+                    ok: last.ok
+                });
+                if (decision.kind === "abort_with_partial") {
+                    verdict = {
+                        status: "partial_verified",
+                        summary: `Aborted to preserve budget — agent stagnated. ${decision.reason} ` +
+                            `Reporting partial verification with the evidence collected so far.`,
+                        toolCalls,
+                        turns,
+                        trace,
+                        quantitativeObservations
+                    };
+                    break;
+                }
+                if (decision.kind === "force_strategy_change") {
+                    // Buffer the advice so it gets prepended to next turn's user
+                    // message. This forces the agent to react to the dead end
+                    // before its next decision instead of repeating itself.
+                    pendingGuardAdvice = decision.advice;
+                }
+            }
+            if (response.stopReason === "end_turn" && toolResults.length === 0) {
+                // Agent stopped without calling complete — treat as blocked.
                 verdict = {
-                    status: "partial_verified",
-                    summary: `Aborted to preserve budget — agent stagnated. ${decision.reason} ` +
-                        `Reporting partial verification with the evidence collected so far.`,
+                    status: "blocked",
+                    summary: "Agent ended the turn without calling complete. Likely confused; check the trace.",
                     toolCalls,
                     turns,
                     trace,
@@ -44278,55 +45959,42 @@ async function runAgent(input) {
                 };
                 break;
             }
-            if (decision.kind === "force_strategy_change") {
-                // Buffer the advice so it gets prepended to next turn's user
-                // message. This forces the agent to react to the dead end
-                // before its next decision instead of repeating itself.
-                pendingGuardAdvice = decision.advice;
-            }
-        }
-        if (response.stopReason === "end_turn" && toolResults.length === 0) {
-            // Agent stopped without calling complete — treat as blocked.
-            verdict = {
-                status: "blocked",
-                summary: "Agent ended the turn without calling complete. Likely confused; check the trace.",
-                toolCalls,
-                turns,
-                trace,
-                quantitativeObservations
-            };
-            break;
-        }
-        if (toolResults.length > 0) {
-            // Append the per-turn progress block as a text block in the same
-            // user message. This keeps the static system prompt byte-identical
-            // (so it cache-hits on Anthropic) while still feeding the agent
-            // fresh criteria/recent-tools context every turn.
-            const progressText = progressBlock(input, {
-                passedCriteria,
-                recentTools: trace.map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
-            });
-            const content = [...toolResults, { type: "text", text: progressText }];
-            if (pendingGuardAdvice) {
-                // Inject guard advice at the END so it's the LAST thing the
-                // agent reads before deciding the next move — prompt salience.
-                content.push({
-                    type: "text",
-                    text: `\n\n[mint guard] ${pendingGuardAdvice}`
+            if (toolResults.length > 0) {
+                // Append the per-turn progress block as a text block in the same
+                // user message. This keeps the static system prompt byte-identical
+                // (so it cache-hits on Anthropic) while still feeding the agent
+                // fresh criteria/recent-tools context every turn.
+                const progressText = progressBlock(input, {
+                    passedCriteria,
+                    recentTools: trace.map((t) => ({ tool: t.tool, input: t.input, ok: t.ok }))
                 });
-                pendingGuardAdvice = null;
+                const content = [...toolResults, { type: "text", text: progressText }];
+                if (pendingGuardAdvice) {
+                    // Inject guard advice at the END so it's the LAST thing the
+                    // agent reads before deciding the next move — prompt salience.
+                    content.push({
+                        type: "text",
+                        text: `\n\n[mint guard] ${pendingGuardAdvice}`
+                    });
+                    pendingGuardAdvice = null;
+                }
+                messages.push({ role: "user", content });
             }
-            messages.push({ role: "user", content });
         }
+        return verdict ?? {
+            status: "blocked",
+            summary: `Hit max turns (${maxTurns}) without complete. Last tools: ${trace.slice(-3).map((t) => t.tool).join(", ")}`,
+            toolCalls,
+            turns,
+            trace,
+            quantitativeObservations
+        };
     }
-    return verdict ?? {
-        status: "blocked",
-        summary: `Hit max turns (${maxTurns}) without complete. Last tools: ${trace.slice(-3).map((t) => t.tool).join(", ")}`,
-        toolCalls,
-        turns,
-        trace,
-        quantitativeObservations
-    };
+    finally {
+        // Always detach the backend-health listeners, including on early
+        // returns from inside the loop (agent threw, stagnation abort, etc.).
+        healthMonitor.detach();
+    }
 }
 
 // EXTERNAL MODULE: ../browser/dist/repetition-guard.js
@@ -44378,7 +46046,11 @@ async function runAgentReplayMission(options, runDir, steps, evidence, artifacts
             successCriteria: replay.brief.successCriteria,
             trace: replay.trace,
             steps,
-            entryUrl: replay.brief.entryUrl
+            entryUrl: replay.brief.entryUrl,
+            // Forward the recorded brief's peek-format version. Today replays
+            // ignore peeks entirely, but the contract is in place so future
+            // replay-side verification can branch on the same flag.
+            briefVersion: replay.brief.briefVersion
         });
         // Drift: replay failed and we have an agent caller — re-explore fresh.
         let fellBack = false;
@@ -44401,7 +46073,13 @@ async function runAgentReplayMission(options, runDir, steps, evidence, artifacts
                 agent: options.agent,
                 steps,
                 userPrompt: replay.brief.userPrompt,
-                userStatedQuantities: replay.brief.userStatedQuantities
+                userStatedQuantities: replay.brief.userStatedQuantities,
+                // Honour the recorded brief's peek-format version even on a fresh
+                // drift-fallback exploration. Pre-v2 briefs (unset) get coerced
+                // to "v1" so the agent sees the same full peek format the original
+                // recording saw — otherwise drift detection could be muddled by
+                // a peek-format change that has nothing to do with UI changes.
+                briefVersion: replay.brief.briefVersion ?? "v1"
             });
         }
         await pauseForVideo(page, options.config, "final");
@@ -44505,7 +46183,12 @@ async function runAgentMission(options, runDir, steps, evidence, artifacts, cons
             agent: options.agent,
             steps,
             userPrompt: brief.userPrompt,
-            userStatedQuantities: brief.userStatedQuantities
+            userStatedQuantities: brief.userStatedQuantities,
+            // Forward the brief's peek-format version (defaults to v1/legacy
+            // inside runAgent when undefined). New briefs from generateAgentBrief
+            // stamp v2; old recorded briefs without the field stay on full
+            // peeks so their behavior is unchanged.
+            briefVersion: brief.briefVersion
         });
         await pauseForVideo(page, options.config, "final");
         await context.close();
@@ -44568,6 +46251,17 @@ async function runAgentMission(options, runDir, steps, evidence, artifacts, cons
         catch { /* noop */ }
     }
 }
+/**
+ * Single entry-point for every mission type. Caller (the GitHub Action
+ * wrapper) invokes this exactly once per run, so each of the three
+ * dispatch branches below launches its own `chromium.launch()` + fresh
+ * `browser.newContext()` and closes both in `finally`. That gives us
+ * pristine localStorage / cookies / sessionStorage per run by
+ * construction — no cross-run state pollution. If you ever refactor
+ * this to invoke multiple missions inside one action invocation,
+ * preserve the per-mission browser+context isolation (don't reuse a
+ * single context across missions).
+ */
 async function runBrowserMission(options) {
     const runDir = await dist_createRunDirectory(options.paths);
     const steps = [];

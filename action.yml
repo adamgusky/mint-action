@@ -15,16 +15,6 @@ inputs:
     description: "Override the Mint API base URL."
     required: false
     default: "https://mint-blond-six.vercel.app"
-  working-directory:
-    description: >
-      Optional subdirectory to run Mint from. Leave empty to run at the repo
-      root (default). Multi-app repos point each scoped mint.yml at its own
-      workflow file, which sets this to the subdirectory the config lives in
-      (e.g. "landing"). The action cd's there before invoking node, so
-      mint reads .mint/product-map.json and .mint/flows/ relative to that
-      directory instead of the repo root.
-    required: false
-    default: ""
 
 runs:
   using: "composite"
@@ -49,14 +39,6 @@ runs:
         MINT_API_KEY: ${{ inputs.api-key }}
         MINT_MISSION_ID: ${{ inputs.mission-id }}
         MINT_API_BASE: ${{ inputs.api-base }}
-        MINT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
       run: |
-        # If working-directory is set, cd there so process.cwd() picks up
-        # the per-app .mint/ files instead of the repo root. Empty string =
-        # no-op (current dir is whatever the workflow set it to). Legacy
-        # workflows that don't pass the input keep cwd === repo root.
-        if [ -n "$MINT_WORKING_DIRECTORY" ]; then
-          cd "$MINT_WORKING_DIRECTORY"
-        fi
         export NODE_PATH="${{ github.action_path }}/node_modules"
         node "${{ github.action_path }}/dist/index.js"
